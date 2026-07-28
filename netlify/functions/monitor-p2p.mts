@@ -56,7 +56,7 @@ export default async () => {
     }
 
     // 2. Spread: (venta - compra) / compra
-    const spreadPct = ((q.bid - q.ask) / q.ask) * 100;
+    const spreadPct = ((q.ask - q.bid) / q.bid) * 100;
 
     // 3. Anotar en la memoria
     const { error } = await supabase.from("p2p_snapshots").insert({
