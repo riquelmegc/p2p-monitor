@@ -99,13 +99,13 @@ export default async () => {
           `🔵 <b>USDT barato en Binance: $${b.ask.toLocaleString("es-CL")}</b>`
         );
       }
-    }
-if (SELL_OPPORTUNITY_CLP > 0 && b.bid >= SELL_OPPORTUNITY_CLP) {
+      if (SELL_OPPORTUNITY_CLP > 0 && b.bid >= SELL_OPPORTUNITY_CLP) {
         alerts.push(
           `🟠 <b>Precio de venta alcanzado: $${b.bid.toLocaleString("es-CL")}</b>\n` +
             `(tu objetivo: $${SELL_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
         );
       }
+    } 
 
     // 5. Mejor ruta de arbitraje (precios CON comisiones)
     let buyEx = valid[0][0], buyPrice = valid[0][1].totalAsk;
