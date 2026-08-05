@@ -2,7 +2,8 @@ import type { Config } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
-// Monitor multi-exchange USDT/CLP (CriptoYa) + arbitraje filtrado
+// Monitor multi-exchange USDT/CLP (CriptoYa)
+// Arbitraje con filtro anti-outlier por mediana
 // ============================================================
 
 const CRIPTOYA_ALL = "https://criptoya.com/api/USDT/CLP/100";
@@ -17,7 +18,7 @@ const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "0.6");
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
 const SELL_OPPORTUNITY_CLP = parseFloat(process.env.SELL_OPPORTUNITY_CLP ?? "0");
 
-// Exchanges con liquidez real en Chile (solo estos entran al calculo de rutas)
+// Exchanges con liquidez real en Chile
 const CONFIABLES = [
   "binancep2p",
   "buda",
@@ -25,6 +26,9 @@ const CONFIABLES = [
   "bybitp2p",
   "vitawallet",
 ];
+
+// Desvio maximo permitido respecto a la mediana del mercado (%)
+const MAX_DESVIO_PCT = 1.5;
 
 interface Quote {
   ask: number;
@@ -57,6 +61,12 @@ async function sendTelegram(text: string) {
   }
 }
 
+function mediana(nums: number[]): number {
+  const s = [...nums].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
 export default async () => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -64,13 +74,13 @@ export default async () => {
     // 1. Mercado completo
     const all = await fetchAllExchanges();
 
-    // 2. Cotizaciones con datos completos (se guardan TODAS)
+    // 2. Cotizaciones con datos completos
     const valid = Object.entries(all).filter(
       ([, q]) => q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
     );
     if (!valid.length) throw new Error("CriptoYa sin cotizaciones validas");
 
-    // 3. Guardar el mercado completo (datos crudos para investigacion)
+    // 3. Guardar el mercado completo (datos crudos)
     const rows = valid.map(([name, q]) => ({
       exchange: name,
       ask: q.ask,
@@ -117,32 +127,47 @@ export default async () => {
       }
     }
 
-    // 5. Rutas de arbitraje SOLO con exchanges confiables y cotizacion coherente
-    const arbitrables = valid.filter(
+    // 5. Rutas de arbitraje con filtro anti-outlier
+    const candidatos = valid.filter(
       ([name, q]) => CONFIABLES.includes(name) && q.totalBid < q.totalAsk
     );
 
     let buyEx = "", buyPrice = 0, sellEx = "", sellPrice = 0, arbPct = 0;
+    const descartados: string[] = [];
 
-    if (arbitrables.length >= 2) {
-      buyEx = arbitrables[0][0];
-      buyPrice = arbitrables[0][1].totalAsk;
-      sellEx = arbitrables[0][0];
-      sellPrice = arbitrables[0][1].totalBid;
+    if (candidatos.length >= 3) {
+      const medios = candidatos.map(([, q]) => (q.totalAsk + q.totalBid) / 2);
+      const ref = mediana(medios);
 
-      for (const [name, q] of arbitrables) {
-        if (q.totalAsk < buyPrice) { buyPrice = q.totalAsk; buyEx = name; }
-        if (q.totalBid > sellPrice) { sellPrice = q.totalBid; sellEx = name; }
-      }
-      arbPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+      const arbitrables = candidatos.filter(([name, q]) => {
+        const desvioAsk = Math.abs((q.totalAsk - ref) / ref) * 100;
+        const desvioBid = Math.abs((q.totalBid - ref) / ref) * 100;
+        const ok = desvioAsk <= MAX_DESVIO_PCT && desvioBid <= MAX_DESVIO_PCT;
+        if (!ok) descartados.push(name);
+        return ok;
+      });
 
-      if (arbPct >= ARB_ALERT_PCT && buyEx !== sellEx) {
-        alerts.push(
-          `⚡ <b>Arbitraje: ${arbPct.toFixed(2)}%</b>\n` +
-            `Comprar en <b>${buyEx}</b> a $${buyPrice.toLocaleString("es-CL")}\n` +
-            `Vender en <b>${sellEx}</b> a $${sellPrice.toLocaleString("es-CL")}\n` +
-            `(bruto; falta descontar red y transferencias)`
-        );
+      if (arbitrables.length >= 2) {
+        buyEx = arbitrables[0][0];
+        buyPrice = arbitrables[0][1].totalAsk;
+        sellEx = arbitrables[0][0];
+        sellPrice = arbitrables[0][1].totalBid;
+
+        for (const [name, q] of arbitrables) {
+          if (q.totalAsk < buyPrice) { buyPrice = q.totalAsk; buyEx = name; }
+          if (q.totalBid > sellPrice) { sellPrice = q.totalBid; sellEx = name; }
+        }
+        arbPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+
+        if (arbPct >= ARB_ALERT_PCT && buyEx !== sellEx) {
+          alerts.push(
+            `⚡ <b>Arbitraje: ${arbPct.toFixed(2)}%</b>\n` +
+              `Comprar en <b>${buyEx}</b> a $${buyPrice.toLocaleString("es-CL")}\n` +
+              `Vender en <b>${sellEx}</b> a $${sellPrice.toLocaleString("es-CL")}\n` +
+              `Referencia mercado: $${ref.toLocaleString("es-CL")}\n` +
+              `(bruto; falta descontar red y transferencias)`
+          );
+        }
       }
     }
 
@@ -155,7 +180,8 @@ export default async () => {
       JSON.stringify({
         ok: true,
         exchanges: valid.length,
-        arbitrables: arbitrables.length,
+        candidatos: candidatos.length,
+        descartados,
         arb: { buyEx, buyPrice, sellEx, sellPrice, arbPct: arbPct.toFixed(2) },
         alertsSent: alerts.length,
       }),
@@ -169,6 +195,7 @@ export default async () => {
   }
 };
 
+// Cron: cada 10 minutos
 export const config: Config = {
   schedule: "*/10 * * * *",
 };
