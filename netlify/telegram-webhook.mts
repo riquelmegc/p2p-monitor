@@ -1,3 +1,4 @@
+// bot finanzas
 import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
