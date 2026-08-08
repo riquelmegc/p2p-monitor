@@ -2,11 +2,16 @@ import type { Config } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
-// Monitor multi-exchange USDT/CLP (CriptoYa)
-// Arbitraje con filtro anti-outlier por mediana
+// Monitor multi-par / multi-exchange (CriptoYa)
+// USDT/CLP: negocio maker + arbitraje
+// BTC/CLP y ETH/CLP: estudio de arbitraje cripto
 // ============================================================
 
-const CRIPTOYA_ALL = "https://criptoya.com/api/USDT/CLP/100";
+const PARES = [
+  { par: "USDT/CLP", url: "https://criptoya.com/api/USDT/CLP/100" },
+  { par: "BTC/CLP", url: "https://criptoya.com/api/BTC/CLP/0.01" },
+  { par: "ETH/CLP", url: "https://criptoya.com/api/ETH/CLP/0.1" },
+];
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
@@ -15,19 +20,21 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
 const SPREAD_ALERT_PCT = parseFloat(process.env.SPREAD_ALERT_PCT ?? "0.8");
 const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "0.6");
+const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5");
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
 const SELL_OPPORTUNITY_CLP = parseFloat(process.env.SELL_OPPORTUNITY_CLP ?? "0");
 
-// Exchanges con liquidez real en Chile
+// Exchanges chilenos con liquidez real
 const CONFIABLES = [
   "binancep2p",
   "buda",
+  "cryptomkt",
   "cryptomktpro",
   "bybitp2p",
   "vitawallet",
+  "orionx",
 ];
 
-// Desvio maximo permitido respecto a la mediana del mercado (%)
 const MAX_DESVIO_PCT = 1.5;
 
 interface Quote {
@@ -36,12 +43,6 @@ interface Quote {
   bid: number;
   totalBid: number;
   time: number;
-}
-
-async function fetchAllExchanges(): Promise<Record<string, Quote>> {
-  const res = await fetch(CRIPTOYA_ALL);
-  if (!res.ok) throw new Error(`CriptoYa HTTP ${res.status}`);
-  return (await res.json()) as Record<string, Quote>;
 }
 
 async function sendTelegram(text: string) {
@@ -69,122 +70,131 @@ function mediana(nums: number[]): number {
 
 export default async () => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  const alerts: string[] = [];
+  const resumen: any[] = [];
 
   try {
-    // 1. Mercado completo
-    const all = await fetchAllExchanges();
+    for (const { par, url } of PARES) {
+      let all: Record<string, Quote>;
 
-    // 2. Cotizaciones con datos completos
-    const valid = Object.entries(all).filter(
-      ([, q]) => q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
-    );
-    if (!valid.length) throw new Error("CriptoYa sin cotizaciones validas");
-
-    // 3. Guardar el mercado completo (datos crudos)
-    const rows = valid.map(([name, q]) => ({
-      exchange: name,
-      ask: q.ask,
-      total_ask: q.totalAsk,
-      bid: q.bid,
-      total_bid: q.totalBid,
-    }));
-    const { error: e1 } = await supabase.from("exchange_quotes").insert(rows);
-    if (e1) console.error("exchange_quotes insert error:", e1.message);
-
-    const alerts: string[] = [];
-
-    // 4. Binance P2P: serie historica + margen maker
-    const b = all["binancep2p"];
-    if (b && b.ask > 0 && b.bid > 0) {
-      const makerPct = ((b.ask - b.bid) / b.bid) * 100;
-      const { error: e2 } = await supabase.from("p2p_snapshots").insert({
-        best_buy_clp: b.ask,
-        best_sell_clp: b.bid,
-        avg_buy_clp: b.totalAsk,
-        avg_sell_clp: b.totalBid,
-        spread_pct: Number(makerPct.toFixed(3)),
-      });
-      if (e2) console.error("p2p_snapshots insert error:", e2.message);
-
-      if (makerPct >= SPREAD_ALERT_PCT) {
-        alerts.push(
-          `🟢 <b>Margen maker Binance: ${makerPct.toFixed(2)}%</b>\n` +
-            `Mercado compra a: $${b.ask.toLocaleString("es-CL")}\n` +
-            `Mercado vende a: $${b.bid.toLocaleString("es-CL")}`
-        );
+      // 1. Consultar el par
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        all = (await res.json()) as Record<string, Quote>;
+      } catch (e: any) {
+        console.error(`Error consultando ${par}:`, e.message);
+        continue;
       }
-      if (BUY_OPPORTUNITY_CLP > 0 && b.ask <= BUY_OPPORTUNITY_CLP) {
-        alerts.push(
-          `🔵 <b>USDT barato en Binance: $${b.ask.toLocaleString("es-CL")}</b>\n` +
-            `(tu objetivo: $${BUY_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
-        );
+
+      // 2. Cotizaciones completas
+      const valid = Object.entries(all).filter(
+        ([, q]) => q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
+      );
+      if (!valid.length) {
+        console.error(`${par}: sin cotizaciones validas`);
+        continue;
       }
-      if (SELL_OPPORTUNITY_CLP > 0 && b.bid >= SELL_OPPORTUNITY_CLP) {
-        alerts.push(
-          `🟠 <b>Precio de venta alcanzado: $${b.bid.toLocaleString("es-CL")}</b>\n` +
-            `(tu objetivo: $${SELL_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
-        );
-      }
-    }
 
-    // 5. Rutas de arbitraje con filtro anti-outlier
-    const candidatos = valid.filter(
-      ([name, q]) => CONFIABLES.includes(name) && q.totalBid < q.totalAsk
-    );
+      // 3. Guardar datos crudos
+      const rows = valid.map(([name, q]) => ({
+        par,
+        exchange: name,
+        ask: q.ask,
+        total_ask: q.totalAsk,
+        bid: q.bid,
+        total_bid: q.totalBid,
+      }));
+      const { error: eIns } = await supabase.from("exchange_quotes").insert(rows);
+      if (eIns) console.error(`insert ${par}:`, eIns.message);
 
-    let buyEx = "", buyPrice = 0, sellEx = "", sellPrice = 0, arbPct = 0;
-    const descartados: string[] = [];
+      // 4. Solo USDT/CLP: serie historica maker + alertas de precio
+      if (par === "USDT/CLP") {
+        const b = all["binancep2p"];
+        if (b && b.ask > 0 && b.bid > 0) {
+          const makerPct = ((b.ask - b.bid) / b.bid) * 100;
+          const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
+            best_buy_clp: b.ask,
+            best_sell_clp: b.bid,
+            avg_buy_clp: b.totalAsk,
+            avg_sell_clp: b.totalBid,
+            spread_pct: Number(makerPct.toFixed(3)),
+          });
+          if (eSnap) console.error("p2p_snapshots insert:", eSnap.message);
 
-    if (candidatos.length >= 3) {
-      const medios = candidatos.map(([, q]) => (q.totalAsk + q.totalBid) / 2);
-      const ref = mediana(medios);
-
-      const arbitrables = candidatos.filter(([name, q]) => {
-        const desvioAsk = Math.abs((q.totalAsk - ref) / ref) * 100;
-        const desvioBid = Math.abs((q.totalBid - ref) / ref) * 100;
-        const ok = desvioAsk <= MAX_DESVIO_PCT && desvioBid <= MAX_DESVIO_PCT;
-        if (!ok) descartados.push(name);
-        return ok;
-      });
-
-      if (arbitrables.length >= 2) {
-        buyEx = arbitrables[0][0];
-        buyPrice = arbitrables[0][1].totalAsk;
-        sellEx = arbitrables[0][0];
-        sellPrice = arbitrables[0][1].totalBid;
-
-        for (const [name, q] of arbitrables) {
-          if (q.totalAsk < buyPrice) { buyPrice = q.totalAsk; buyEx = name; }
-          if (q.totalBid > sellPrice) { sellPrice = q.totalBid; sellEx = name; }
+          if (makerPct >= SPREAD_ALERT_PCT) {
+            alerts.push(
+              `🟢 <b>Margen maker Binance: ${makerPct.toFixed(2)}%</b>\n` +
+                `Mercado compra a: $${b.ask.toLocaleString("es-CL")}\n` +
+                `Mercado vende a: $${b.bid.toLocaleString("es-CL")}`
+            );
+          }
+          if (BUY_OPPORTUNITY_CLP > 0 && b.ask <= BUY_OPPORTUNITY_CLP) {
+            alerts.push(
+              `🔵 <b>USDT barato: $${b.ask.toLocaleString("es-CL")}</b>\n` +
+                `(tu objetivo: $${BUY_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
+            );
+          }
+          if (SELL_OPPORTUNITY_CLP > 0 && b.bid >= SELL_OPPORTUNITY_CLP) {
+            alerts.push(
+              `🟠 <b>Precio de venta alcanzado: $${b.bid.toLocaleString("es-CL")}</b>\n` +
+                `(tu objetivo: $${SELL_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
+            );
+          }
         }
-        arbPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+      }
 
-        if (arbPct >= ARB_ALERT_PCT && buyEx !== sellEx) {
-          alerts.push(
-            `⚡ <b>Arbitraje: ${arbPct.toFixed(2)}%</b>\n` +
-              `Comprar en <b>${buyEx}</b> a $${buyPrice.toLocaleString("es-CL")}\n` +
-              `Vender en <b>${sellEx}</b> a $${sellPrice.toLocaleString("es-CL")}\n` +
-              `Referencia mercado: $${ref.toLocaleString("es-CL")}\n` +
-              `(bruto; falta descontar red y transferencias)`
-          );
+      // 5. Arbitraje del par, con filtro anti-outlier
+      const candidatos = valid.filter(
+        ([name, q]) => CONFIABLES.includes(name) && q.totalBid < q.totalAsk
+      );
+
+      if (candidatos.length >= 3) {
+        const medios = candidatos.map(([, q]) => (q.totalAsk + q.totalBid) / 2);
+        const ref = mediana(medios);
+
+        const arbitrables = candidatos.filter(([, q]) => {
+          const dAsk = Math.abs((q.totalAsk - ref) / ref) * 100;
+          const dBid = Math.abs((q.totalBid - ref) / ref) * 100;
+          return dAsk <= MAX_DESVIO_PCT && dBid <= MAX_DESVIO_PCT;
+        });
+
+        if (arbitrables.length >= 2) {
+          let buyEx = arbitrables[0][0];
+          let buyPrice = arbitrables[0][1].totalAsk;
+          let sellEx = arbitrables[0][0];
+          let sellPrice = arbitrables[0][1].totalBid;
+
+          for (const [name, q] of arbitrables) {
+            if (q.totalAsk < buyPrice) { buyPrice = q.totalAsk; buyEx = name; }
+            if (q.totalBid > sellPrice) { sellPrice = q.totalBid; sellEx = name; }
+          }
+
+          const arbPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+          const umbral = par === "USDT/CLP" ? ARB_ALERT_PCT : ARB_CRYPTO_ALERT_PCT;
+
+          resumen.push({ par, buyEx, sellEx, arbPct: arbPct.toFixed(3) });
+
+          if (arbPct >= umbral && buyEx !== sellEx) {
+            alerts.push(
+              `⚡ <b>Arbitraje ${par}: ${arbPct.toFixed(2)}%</b>\n` +
+                `Comprar en <b>${buyEx}</b> a $${buyPrice.toLocaleString("es-CL")}\n` +
+                `Vender en <b>${sellEx}</b> a $${sellPrice.toLocaleString("es-CL")}\n` +
+                `Referencia: $${ref.toLocaleString("es-CL")}\n` +
+                `(bruto; falta descontar red y movimiento de precio)`
+            );
+          }
         }
       }
     }
 
     // 6. Enviar alertas
     for (const msg of alerts) {
-      await sendTelegram(`💱 <b>P2P USDT/CLP</b>\n\n${msg}`);
+      await sendTelegram(`💱 <b>Monitor Cripto CLP</b>\n\n${msg}`);
     }
 
     return new Response(
-      JSON.stringify({
-        ok: true,
-        exchanges: valid.length,
-        candidatos: candidatos.length,
-        descartados,
-        arb: { buyEx, buyPrice, sellEx, sellPrice, arbPct: arbPct.toFixed(2) },
-        alertsSent: alerts.length,
-      }),
+      JSON.stringify({ ok: true, resumen, alertsSent: alerts.length }),
       { headers: { "Content-Type": "application/json" } }
     );
   } catch (err: any) {
