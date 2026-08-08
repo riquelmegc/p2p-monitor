@@ -11,6 +11,7 @@ const PARES = [
   { par: "USDT/CLP", url: "https://criptoya.com/api/USDT/CLP/100" },
   { par: "BTC/CLP", url: "https://criptoya.com/api/BTC/CLP/0.01" },
   { par: "ETH/CLP", url: "https://criptoya.com/api/ETH/CLP/0.1" },
+  { par: "XRP/CLP", url: "https://criptoya.com/api/XRP/CLP/1000" },
 ];
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
