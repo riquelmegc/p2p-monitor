@@ -179,4 +179,102 @@ export default async (req) => {
       const c = rows && rows[0];
       if (c) {
         const ops = c.total_operaciones + 1;
-        const
+        const acum = Number(c.monto_acumulado_clp) + monto;
+        await supabase.from("contrapartes").update({ total_operaciones: ops, monto_acumulado_clp: acum, ultima_operacion: hoyChile(), banco: banco ?? c.banco }).eq("id", c.id);
+        await reply(`✅ <b>Registrado</b> — ${c.nickname}\nOperaciones: ${ops}\nAcumulado: ${clp(acum)}\nNuevo límite: <b>${clp(limiteSugerido(ops))}</b>`);
+      } else {
+        await supabase.from("contrapartes").insert({ nickname: nick, banco, total_operaciones: 1, monto_acumulado_clp: monto, ultima_operacion: hoyChile() });
+        await reply(`✅ <b>Nueva contraparte</b> — ${nick}\nPrimera operación: ${clp(monto)}`);
+      }
+      return new Response("ok");
+    }
+
+    if (primera === "/bloquear") {
+      const nick = partes[1];
+      const motivo = partes.slice(2).join(" ") || "sin motivo";
+      if (!nick) { await reply("Uso: <code>/bloquear nickname motivo</code>"); return new Response("ok"); }
+      const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
+      const c = rows && rows[0];
+      if (c) {
+        await supabase.from("contrapartes").update({ confiable: false, notas: motivo }).eq("id", c.id);
+      } else {
+        await supabase.from("contrapartes").insert({ nickname: nick, confiable: false, notas: motivo });
+      }
+      await reply(`⛔ <b>Bloqueado</b> — ${nick}\nMotivo: ${motivo}`);
+      return new Response("ok");
+    }
+
+    if (primera === "/ok") {
+      const nick = partes[1];
+      if (!nick) { await reply("Uso: <code>/ok nickname</code>"); return new Response("ok"); }
+      const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
+      const c = rows && rows[0];
+      if (!c) { await reply(`No encontré a ${nick}`); return new Response("ok"); }
+      await supabase.from("contrapartes").update({ confiable: true, notas: null }).eq("id", c.id);
+      await reply(`🟢 <b>Desbloqueado</b> — ${c.nickname}`);
+      return new Response("ok");
+    }
+
+    if (primera === "/top") {
+      const { data } = await supabase.from("contrapartes").select("nickname,total_operaciones,monto_acumulado_clp")
+        .eq("confiable", true).order("total_operaciones", { ascending: false }).limit(10);
+      if (!data?.length) { await reply("Aún no hay contrapartes."); return new Response("ok"); }
+      const lineas = data.map((c, i) => `${i + 1}. <b>${c.nickname}</b> — ${c.total_operaciones} ops · ${clp(c.monto_acumulado_clp)}`);
+      await reply(`🏆 <b>Mejores clientes</b>\n\n${lineas.join("\n")}`);
+      return new Response("ok");
+    }
+
+    if (primera.startsWith("/")) {
+      await reply(`No conozco ese comando.\n\n${AYUDA}`);
+      return new Response("ok");
+    }
+
+    // Registro de movimiento: palabra monto [descripcion]
+    const monto = parseFloat((partes[1] ?? "").replace(/[.,]/g, ""));
+    const descripcion = partes.slice(2).join(" ") || null;
+    if (isNaN(monto) || monto <= 0) {
+      await reply(`No entendí. Formato:\n<code>palabra monto [descripción]</code>\n\nEj: <code>almuerzo 8500 con los cabros</code>\n\n/help para ver todo.`);
+      return new Response("ok");
+    }
+
+    const palabra = normalizar(partes[0]);
+    const { data: dicRows } = await supabase.from("diccionario").select("*").eq("palabra", palabra).limit(1);
+    const dic = dicRows && dicRows[0];
+
+    let esfera = "personal", tipo = "gasto", categoria = "otros", clasificado = true;
+    if (dic) {
+      esfera = dic.esfera; tipo = dic.tipo; categoria = dic.categoria;
+    } else {
+      clasificado = false;
+      const { data: pend } = await supabase.from("palabras_pendientes").select("*").eq("palabra", palabra).limit(1);
+      if (pend && pend[0]) {
+        await supabase.from("palabras_pendientes").update({ veces: pend[0].veces + 1, ultima_vez: new Date().toISOString() }).eq("palabra", palabra);
+      } else {
+        await supabase.from("palabras_pendientes").insert({ palabra });
+      }
+    }
+
+    let retencion = 0;
+    if (esfera === "uber" && tipo === "ingreso" && categoria === "uber") {
+      retencion = Math.round(monto * RETENCION_UBER);
+    }
+    const neto = tipo === "ingreso" ? monto - retencion : monto;
+
+    await supabase.from("finanzas").insert({
+      fecha: hoyChile(), esfera, tipo, categoria, palabra, descripcion,
+      monto_clp: monto, retencion_clp: retencion, neto_clp: neto, clasificado,
+    });
+
+    let respuesta = `${tipo === "ingreso" ? "🟢" : "🔴"} <b>${palabra}</b> ${clp(monto)}\n${esfera} · ${categoria}` +
+      (descripcion ? `\n"${descripcion}"` : "");
+    if (retencion > 0) respuesta += `\n\nRetención SII (15,25%): -${clp(retencion)}\n<b>Neto: ${clp(neto)}</b>`;
+    if (!clasificado) respuesta += `\n\n⚠️ Palabra nueva, guardada en <i>otros</i>.\nUsa /pendientes para clasificarla.`;
+
+    await reply(respuesta);
+    return new Response("ok");
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+    await reply(`⚠️ Error: ${err.message}`);
+    return new Response("ok");
+  }
+};
