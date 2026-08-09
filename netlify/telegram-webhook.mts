@@ -1,5 +1,7 @@
 // bot finanzas
+import type { Config } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
+
 
 // ============================================================
 // Bot conversacional: finanzas personales + contrapartes P2P
@@ -479,4 +481,8 @@ export default async (req: Request) => {
     await reply(`⚠️ Error: ${err.message}`);
     return new Response("ok");
   }
+};
+
+export const config: Config = {
+  path: "/webhook-bot",
 };
