@@ -76,8 +76,30 @@ export default async (req) => {
   const primera = partes[0].toLowerCase().split("@")[0];
 
   try {
-    if (primera === "/start" || primera === "/help" || primera === "/ayuda") {
-      await reply(AYUDA);
+      if (primera === "/diccionario") {
+      const { data } = await supabase
+        .from("diccionario")
+        .select("palabra,esfera,categoria")
+        .order("esfera")
+        .order("categoria");
+      if (!data?.length) {
+        await reply("El diccionario está vacío.");
+        return new Response("ok");
+      }
+      const porEsfera = {};
+      for (const d of data) {
+        if (!porEsfera[d.esfera]) porEsfera[d.esfera] = {};
+        if (!porEsfera[d.esfera][d.categoria]) porEsfera[d.esfera][d.categoria] = [];
+        porEsfera[d.esfera][d.categoria].push(d.palabra);
+      }
+      let texto = "📖 <b>Diccionario</b>\n";
+      for (const esfera of Object.keys(porEsfera)) {
+        texto += `\n<b>━ ${esfera.toUpperCase()} ━</b>\n`;
+        for (const cat of Object.keys(porEsfera[esfera])) {
+          texto += `<b>${cat}:</b> ${porEsfera[esfera][cat].join(", ")}\n`;
+        }
+      }
+      await reply(texto);
       return new Response("ok");
     }
 
