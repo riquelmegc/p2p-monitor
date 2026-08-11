@@ -52,7 +52,7 @@ async function sendTelegram(text: string) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      chat_id: chat_id: TELEGRAM_ALERT_CHAT_ID,
+      chat_id: TELEGRAM_ALERT_CHAT_ID,
       text,
       parse_mode: "HTML",
     }),
