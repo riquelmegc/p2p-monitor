@@ -7,6 +7,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 const RETENCION_UBER = 0.1525;
+const IMPUESTO_P2P = 0.20;
 
 async function reply(text) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -30,9 +31,8 @@ function normalizar(s) {
 
 function limiteSugerido(ops) {
   if (ops <= 0) return 250000;
-  if (ops <= 3) return 500000;
-  if (ops <= 9) return 1000000;
-  return 2000000;
+  if (ops <= 2) return 2000000;
+  return 5000000;
 }
 
 const AYUDA =
@@ -48,8 +48,10 @@ const AYUDA =
   "  /hoy /mes /uber\n" +
   "  /pendientes /diccionario\n" +
   "  /agregar palabra esfera tipo categoria\n\n" +
-  "<b>Contrapartes:</b>\n" +
-  "  /check /reg /bloquear /ok /top";
+  "<b>Contrapartes P2P:</b>\n" +
+  "  /check nickname\n" +
+  "  /reg nickname monto ganancia [banco]\n" +
+  "  /bloquear /ok /top /impuesto";
 
 export default async (req) => {
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -217,19 +219,26 @@ export default async (req) => {
 
     if (primera === "/reg") {
       const nick = partes[1];
-      const monto = parseFloat(partes[2] ?? "");
-      const banco = partes.slice(3).join(" ") || null;
-      if (!nick || isNaN(monto) || monto <= 0) { await reply("Uso: <code>/reg nickname monto [banco]</code>"); return new Response("ok"); }
+      const monto = parseFloat((partes[2] ?? "").replace(/[.,]/g, ""));
+      const ganancia = parseFloat((partes[3] ?? "").replace(/[.,]/g, ""));
+      const banco = partes.slice(4).join(" ") || null;
+      if (!nick || isNaN(monto) || monto <= 0 || isNaN(ganancia)) {
+        await reply("Uso: <code>/reg nickname monto ganancia [banco]</code>\nEj: <code>/reg juanito 200000 4000 mercadopago</code>");
+        return new Response("ok");
+      }
+      const impuesto = Math.round(ganancia * IMPUESTO_P2P);
+      await supabase.from("impuesto_apartado").insert({ nickname: nick, monto_operado_clp: monto, ganancia_clp: ganancia, impuesto_clp: impuesto });
       const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
       const c = rows && rows[0];
       if (c) {
         const ops = c.total_operaciones + 1;
         const acum = Number(c.monto_acumulado_clp) + monto;
-        await supabase.from("contrapartes").update({ total_operaciones: ops, monto_acumulado_clp: acum, ultima_operacion: hoyChile(), banco: banco ?? c.banco }).eq("id", c.id);
-        await reply(`✅ <b>Registrado</b> — ${c.nickname}\nOperaciones: ${ops}\nAcumulado: ${clp(acum)}\nNuevo límite: <b>${clp(limiteSugerido(ops))}</b>`);
+        const gAcum = Number(c.ganancia_acumulada_clp || 0) + ganancia;
+        await supabase.from("contrapartes").update({ total_operaciones: ops, monto_acumulado_clp: acum, ganancia_acumulada_clp: gAcum, ultima_operacion: hoyChile(), banco: banco ?? c.banco }).eq("id", c.id);
+        await reply(`✅ <b>Registrado</b> — ${c.nickname}\nOperaciones: ${ops}\nMonto: ${clp(monto)} · Ganancia: ${clp(ganancia)}\n💰 Apartado impuesto (20%): ${clp(impuesto)}\nNuevo límite: <b>${clp(limiteSugerido(ops))}</b>`);
       } else {
-        await supabase.from("contrapartes").insert({ nickname: nick, banco, total_operaciones: 1, monto_acumulado_clp: monto, ultima_operacion: hoyChile() });
-        await reply(`✅ <b>Nueva contraparte</b> — ${nick}\nPrimera operación: ${clp(monto)}`);
+        await supabase.from("contrapartes").insert({ nickname: nick, banco, total_operaciones: 1, monto_acumulado_clp: monto, ganancia_acumulada_clp: ganancia, ultima_operacion: hoyChile() });
+        await reply(`✅ <b>Nueva contraparte</b> — ${nick}\nMonto: ${clp(monto)} · Ganancia: ${clp(ganancia)}\n💰 Apartado impuesto (20%): ${clp(impuesto)}`);
       }
       return new Response("ok");
     }
@@ -262,6 +271,17 @@ export default async (req) => {
       if (!data?.length) { await reply("Aún no hay contrapartes."); return new Response("ok"); }
       const lineas = data.map((c, i) => `${i + 1}. <b>${c.nickname}</b> — ${c.total_operaciones} ops · ${clp(c.monto_acumulado_clp)}`);
       await reply(`🏆 <b>Mejores clientes</b>\n\n${lineas.join("\n")}`);
+      return new Response("ok");
+    }
+
+    if (primera === "/impuesto") {
+      const { data } = await supabase.from("impuesto_apartado").select("ganancia_clp,impuesto_clp,monto_operado_clp");
+      const lista = data ?? [];
+      if (!lista.length) { await reply("Aún no has registrado operaciones con ganancia."); return new Response("ok"); }
+      const totalOp = lista.reduce((s, r) => s + Number(r.monto_operado_clp), 0);
+      const totalGan = lista.reduce((s, r) => s + Number(r.ganancia_clp), 0);
+      const totalImp = lista.reduce((s, r) => s + Number(r.impuesto_clp), 0);
+      await reply(`🧾 <b>Impuesto apartado</b>\n\nOperaciones: ${lista.length}\nVolumen operado: ${clp(totalOp)}\nGanancia total: ${clp(totalGan)}\n\n<b>💰 Apartado para SII (20%): ${clp(totalImp)}</b>\n<i>No tocar este dinero.</i>`);
       return new Response("ok");
     }
 
