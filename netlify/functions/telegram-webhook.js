@@ -37,22 +37,19 @@ function limiteSugerido(ops) {
 
 const AYUDA =
   "🤖 <b>Cómo usarme</b>\n\n" +
-  "<b>Registrar</b> (sin comandos):\n" +
+  "<b>Finanzas</b> (sin comandos):\n" +
   "  <code>uber 200000</code>\n" +
-  "  <code>super 45000 compras semana</code>\n" +
-  "  <code>bencina 25000</code>\n\n" +
-  "<b>Consultas:</b>\n" +
-  "  /hoy — movimientos de hoy\n" +
-  "  /mes — balance por esfera\n" +
-  "  /uber — ganancia neta manejando\n" +
-  "  /pendientes — palabras sin clasificar\n" +
+  "  <code>super 45000 compras semana</code>\n\n" +
+  "<b>Autopistas:</b>\n" +
+  "  <code>tag central 20896 07-09</code>\n" +
+  "  /tags — pendientes ordenadas\n" +
+  "  /pague apodo — marcar pagada\n\n" +
+  "<b>Consultas finanzas:</b>\n" +
+  "  /hoy /mes /uber\n" +
+  "  /pendientes /diccionario\n" +
   "  /agregar palabra esfera tipo categoria\n\n" +
   "<b>Contrapartes:</b>\n" +
-  "  /check nickname\n" +
-  "  /reg nickname monto [banco]\n" +
-  "  /bloquear nickname motivo\n" +
-  "  /ok nickname\n" +
-  "  /top";
+  "  /check /reg /bloquear /ok /top";
 
 export default async (req) => {
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -76,16 +73,14 @@ export default async (req) => {
   const primera = partes[0].toLowerCase().split("@")[0];
 
   try {
-      if (primera === "/diccionario") {
-      const { data } = await supabase
-        .from("diccionario")
-        .select("palabra,esfera,categoria")
-        .order("esfera")
-        .order("categoria");
-      if (!data?.length) {
-        await reply("El diccionario está vacío.");
-        return new Response("ok");
-      }
+    if (primera === "/start" || primera === "/help" || primera === "/ayuda") {
+      await reply(AYUDA);
+      return new Response("ok");
+    }
+
+    if (primera === "/diccionario") {
+      const { data } = await supabase.from("diccionario").select("palabra,esfera,categoria").order("esfera").order("categoria");
+      if (!data?.length) { await reply("El diccionario está vacío."); return new Response("ok"); }
       const porEsfera = {};
       for (const d of data) {
         if (!porEsfera[d.esfera]) porEsfera[d.esfera] = {};
@@ -103,13 +98,51 @@ export default async (req) => {
       return new Response("ok");
     }
 
+    if (primera === "/tags") {
+      const verPagadas = (partes[1] || "").toLowerCase() === "pagadas";
+      const { data } = await supabase.from("autopistas").select("*").eq("pagada", verPagadas).order("vencimiento");
+      if (!data?.length) {
+        await reply(verPagadas ? "No hay boletas pagadas registradas." : "🎉 No tienes autopistas pendientes.");
+        return new Response("ok");
+      }
+      if (verPagadas) {
+        const lineas = data.map((a) => `✅ ${a.apodo} — ${clp(a.monto_clp)} (pagada ${a.fecha_pago})`);
+        await reply(`<b>Autopistas pagadas</b>\n\n${lineas.join("\n")}`);
+        return new Response("ok");
+      }
+      const hoy = new Date(Date.now() - 4 * 3600 * 1000);
+      hoy.setHours(0, 0, 0, 0);
+      let total = 0;
+      const lineas = data.map((a) => {
+        total += Number(a.monto_clp);
+        const venc = new Date(a.vencimiento + "T00:00:00");
+        const dias = Math.round((venc - hoy) / (1000 * 3600 * 24));
+        let urgencia = "🟢";
+        if (dias < 0) urgencia = "⛔";
+        else if (dias <= 3) urgencia = "🔴";
+        else if (dias <= 7) urgencia = "🟡";
+        const txtDias = dias < 0 ? `VENCIDA hace ${-dias}d` : dias === 0 ? "VENCE HOY" : `en ${dias} días`;
+        return `${urgencia} <b>${a.apodo}</b> — ${clp(a.monto_clp)}\n   vence ${a.vencimiento} (${txtDias})`;
+      });
+      await reply(`🛣️ <b>Autopistas pendientes</b>\n\n${lineas.join("\n\n")}\n\n━━━━━━━━\n<b>TOTAL: ${clp(total)}</b>`);
+      return new Response("ok");
+    }
+
+    if (primera === "/pague") {
+      const apodo = (partes[1] || "").toLowerCase();
+      if (!apodo) { await reply("Uso: <code>/pague apodo</code>\nEj: /pague central"); return new Response("ok"); }
+      const { data: rows } = await supabase.from("autopistas").select("*").ilike("apodo", apodo).eq("pagada", false).limit(1);
+      const a = rows && rows[0];
+      if (!a) { await reply(`No encontré una boleta pendiente con apodo "${apodo}".\nUsa /tags para ver las pendientes.`); return new Response("ok"); }
+      await supabase.from("autopistas").update({ pagada: true, fecha_pago: hoyChile() }).eq("id", a.id);
+      await reply(`✅ <b>Pagada</b> — ${a.apodo} (${clp(a.monto_clp)})\nSalió de tus pendientes.`);
+      return new Response("ok");
+    }
+
     if (primera === "/hoy") {
-      const { data } = await supabase.from("finanzas").select("*")
-        .eq("fecha", hoyChile()).order("id", { ascending: false });
+      const { data } = await supabase.from("finanzas").select("*").eq("fecha", hoyChile()).order("id", { ascending: false });
       if (!data?.length) { await reply("No hay movimientos hoy."); return new Response("ok"); }
-      const lineas = data.map((m) =>
-        `${m.tipo === "ingreso" ? "🟢" : "🔴"} ${m.palabra} ${clp(m.monto_clp)}` +
-        (m.descripcion ? ` — ${m.descripcion}` : ""));
+      const lineas = data.map((m) => `${m.tipo === "ingreso" ? "🟢" : "🔴"} ${m.palabra} ${clp(m.monto_clp)}` + (m.descripcion ? ` — ${m.descripcion}` : ""));
       const ing = data.filter((m) => m.tipo === "ingreso").reduce((s, m) => s + Number(m.monto_clp), 0);
       const gas = data.filter((m) => m.tipo === "gasto").reduce((s, m) => s + Number(m.monto_clp), 0);
       await reply(`📅 <b>Hoy</b>\n\n${lineas.join("\n")}\n\nIngresos: ${clp(ing)}\nGastos: ${clp(gas)}\n<b>Balance: ${clp(ing - gas)}</b>`);
@@ -126,9 +159,7 @@ export default async (req) => {
         const ing = f.filter((m) => m.tipo === "ingreso").reduce((s, m) => s + Number(m.monto_clp), 0);
         const gas = f.filter((m) => m.tipo === "gasto").reduce((s, m) => s + Number(m.monto_clp), 0);
         const ret = f.reduce((s, m) => s + Number(m.retencion_clp), 0);
-        return `<b>${e.toUpperCase()}</b>\n  Ingresos: ${clp(ing)}\n` +
-          (ret > 0 ? `  Retención: -${clp(ret)}\n` : "") +
-          `  Gastos: ${clp(gas)}\n  Balance: <b>${clp(ing - ret - gas)}</b>`;
+        return `<b>${e.toUpperCase()}</b>\n  Ingresos: ${clp(ing)}\n` + (ret > 0 ? `  Retención: -${clp(ret)}\n` : "") + `  Gastos: ${clp(gas)}\n  Balance: <b>${clp(ing - ret - gas)}</b>`;
       });
       const tI = lista.filter((m) => m.tipo === "ingreso").reduce((s, m) => s + Number(m.monto_clp), 0);
       const tG = lista.filter((m) => m.tipo === "gasto").reduce((s, m) => s + Number(m.monto_clp), 0);
@@ -139,19 +170,15 @@ export default async (req) => {
 
     if (primera === "/uber") {
       const desde = hoyChile().slice(0, 8) + "01";
-      const { data } = await supabase.from("finanzas").select("tipo,categoria,monto_clp,retencion_clp")
-        .eq("esfera", "uber").gte("fecha", desde);
+      const { data } = await supabase.from("finanzas").select("tipo,categoria,monto_clp,retencion_clp").eq("esfera", "uber").gte("fecha", desde);
       const lista = data ?? [];
       const bruto = lista.filter((m) => m.tipo === "ingreso").reduce((s, m) => s + Number(m.monto_clp), 0);
       const ret = lista.reduce((s, m) => s + Number(m.retencion_clp), 0);
       const gastos = lista.filter((m) => m.tipo === "gasto").reduce((s, m) => s + Number(m.monto_clp), 0);
       const porCat = {};
-      for (const m of lista.filter((x) => x.tipo === "gasto")) {
-        porCat[m.categoria] = (porCat[m.categoria] ?? 0) + Number(m.monto_clp);
-      }
+      for (const m of lista.filter((x) => x.tipo === "gasto")) { porCat[m.categoria] = (porCat[m.categoria] ?? 0) + Number(m.monto_clp); }
       const detalle = Object.entries(porCat).map(([c, v]) => `  ${c}: ${clp(v)}`).join("\n");
-      await reply(`🚗 <b>Uber — mes</b>\n\nBruto: ${clp(bruto)}\nRetención SII (15,25%): -${clp(ret)}\n` +
-        `Gastos:\n${detalle || "  (sin gastos)"}\nTotal gastos: -${clp(gastos)}\n\n<b>GANANCIA REAL: ${clp(bruto - ret - gastos)}</b>`);
+      await reply(`🚗 <b>Uber — mes</b>\n\nBruto: ${clp(bruto)}\nRetención SII (15,25%): -${clp(ret)}\nGastos:\n${detalle || "  (sin gastos)"}\nTotal gastos: -${clp(gastos)}\n\n<b>GANANCIA REAL: ${clp(bruto - ret - gastos)}</b>`);
       return new Response("ok");
     }
 
@@ -165,10 +192,7 @@ export default async (req) => {
 
     if (primera === "/agregar") {
       const [, pal, esf, tip, cat] = partes;
-      if (!pal || !esf || !tip || !cat) {
-        await reply("Uso: <code>/agregar palabra esfera tipo categoria</code>\nesfera: personal|uber|p2p\ntipo: ingreso|gasto");
-        return new Response("ok");
-      }
+      if (!pal || !esf || !tip || !cat) { await reply("Uso: <code>/agregar palabra esfera tipo categoria</code>\nesfera: personal|uber|p2p\ntipo: ingreso|gasto"); return new Response("ok"); }
       const p = normalizar(pal);
       await supabase.from("diccionario").upsert({ palabra: p, esfera: esf.toLowerCase(), tipo: tip.toLowerCase(), categoria: cat.toLowerCase() });
       await supabase.from("palabras_pendientes").delete().eq("palabra", p);
@@ -186,8 +210,7 @@ export default async (req) => {
       } else if (c.confiable === false) {
         await reply(`⛔ <b>BLOQUEADO</b> — ${c.nickname}\n\nMotivo: ${c.notas ?? "sin nota"}\n\n<b>NO OPERAR</b>`);
       } else {
-        await reply(`🟢 <b>CONOCIDO</b> — ${c.nickname}\n\nOperaciones: <b>${c.total_operaciones}</b>\nAcumulado: ${clp(c.monto_acumulado_clp)}\nÚltima: ${c.ultima_operacion ?? "-"}\n` +
-          (c.banco ? `Banco: ${c.banco}\n` : "") + `\nLímite sugerido: <b>${clp(limiteSugerido(c.total_operaciones))}</b>`);
+        await reply(`🟢 <b>CONOCIDO</b> — ${c.nickname}\n\nOperaciones: <b>${c.total_operaciones}</b>\nAcumulado: ${clp(c.monto_acumulado_clp)}\nÚltima: ${c.ultima_operacion ?? "-"}\n` + (c.banco ? `Banco: ${c.banco}\n` : "") + `\nLímite sugerido: <b>${clp(limiteSugerido(c.total_operaciones))}</b>`);
       }
       return new Response("ok");
     }
@@ -217,11 +240,8 @@ export default async (req) => {
       if (!nick) { await reply("Uso: <code>/bloquear nickname motivo</code>"); return new Response("ok"); }
       const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
       const c = rows && rows[0];
-      if (c) {
-        await supabase.from("contrapartes").update({ confiable: false, notas: motivo }).eq("id", c.id);
-      } else {
-        await supabase.from("contrapartes").insert({ nickname: nick, confiable: false, notas: motivo });
-      }
+      if (c) { await supabase.from("contrapartes").update({ confiable: false, notas: motivo }).eq("id", c.id); }
+      else { await supabase.from("contrapartes").insert({ nickname: nick, confiable: false, notas: motivo }); }
       await reply(`⛔ <b>Bloqueado</b> — ${nick}\nMotivo: ${motivo}`);
       return new Response("ok");
     }
@@ -238,11 +258,27 @@ export default async (req) => {
     }
 
     if (primera === "/top") {
-      const { data } = await supabase.from("contrapartes").select("nickname,total_operaciones,monto_acumulado_clp")
-        .eq("confiable", true).order("total_operaciones", { ascending: false }).limit(10);
+      const { data } = await supabase.from("contrapartes").select("nickname,total_operaciones,monto_acumulado_clp").eq("confiable", true).order("total_operaciones", { ascending: false }).limit(10);
       if (!data?.length) { await reply("Aún no hay contrapartes."); return new Response("ok"); }
       const lineas = data.map((c, i) => `${i + 1}. <b>${c.nickname}</b> — ${c.total_operaciones} ops · ${clp(c.monto_acumulado_clp)}`);
       await reply(`🏆 <b>Mejores clientes</b>\n\n${lineas.join("\n")}`);
+      return new Response("ok");
+    }
+
+    // Registro de boleta de autopista: tag apodo monto dd-mm
+    if (primera === "tag") {
+      const apodo = (partes[1] || "").toLowerCase();
+      const monto = parseFloat((partes[2] || "").replace(/[.,]/g, ""));
+      const fechaRaw = partes[3] || "";
+      if (!apodo || isNaN(monto) || monto <= 0 || !fechaRaw) { await reply("Uso: <code>tag apodo monto dd-mm</code>\nEj: <code>tag central 20896 07-09</code>"); return new Response("ok"); }
+      const m = fechaRaw.match(/^(\d{1,2})[-\/](\d{1,2})$/);
+      if (!m) { await reply("Fecha inválida. Usa formato dd-mm\nEj: 07-09"); return new Response("ok"); }
+      const dd = m[1].padStart(2, "0");
+      const mm = m[2].padStart(2, "0");
+      const anio = new Date().getFullYear();
+      const venc = `${anio}-${mm}-${dd}`;
+      await supabase.from("autopistas").insert({ apodo, monto_clp: monto, vencimiento: venc });
+      await reply(`🛣️ <b>Boleta registrada</b>\n${apodo} — ${clp(monto)}\nVence: ${venc}\n\nUsa /tags para ver todas.`);
       return new Response("ok");
     }
 
@@ -251,7 +287,7 @@ export default async (req) => {
       return new Response("ok");
     }
 
-    // Registro de movimiento: palabra monto [descripcion]
+    // Registro de movimiento financiero: palabra monto [descripcion]
     const monto = parseFloat((partes[1] ?? "").replace(/[.,]/g, ""));
     const descripcion = partes.slice(2).join(" ") || null;
     if (isNaN(monto) || monto <= 0) {
@@ -264,31 +300,21 @@ export default async (req) => {
     const dic = dicRows && dicRows[0];
 
     let esfera = "personal", tipo = "gasto", categoria = "otros", clasificado = true;
-    if (dic) {
-      esfera = dic.esfera; tipo = dic.tipo; categoria = dic.categoria;
-    } else {
+    if (dic) { esfera = dic.esfera; tipo = dic.tipo; categoria = dic.categoria; }
+    else {
       clasificado = false;
       const { data: pend } = await supabase.from("palabras_pendientes").select("*").eq("palabra", palabra).limit(1);
-      if (pend && pend[0]) {
-        await supabase.from("palabras_pendientes").update({ veces: pend[0].veces + 1, ultima_vez: new Date().toISOString() }).eq("palabra", palabra);
-      } else {
-        await supabase.from("palabras_pendientes").insert({ palabra });
-      }
+      if (pend && pend[0]) { await supabase.from("palabras_pendientes").update({ veces: pend[0].veces + 1, ultima_vez: new Date().toISOString() }).eq("palabra", palabra); }
+      else { await supabase.from("palabras_pendientes").insert({ palabra }); }
     }
 
     let retencion = 0;
-    if (esfera === "uber" && tipo === "ingreso" && categoria === "uber") {
-      retencion = Math.round(monto * RETENCION_UBER);
-    }
+    if (esfera === "uber" && tipo === "ingreso" && categoria === "uber") { retencion = Math.round(monto * RETENCION_UBER); }
     const neto = tipo === "ingreso" ? monto - retencion : monto;
 
-    await supabase.from("finanzas").insert({
-      fecha: hoyChile(), esfera, tipo, categoria, palabra, descripcion,
-      monto_clp: monto, retencion_clp: retencion, neto_clp: neto, clasificado,
-    });
+    await supabase.from("finanzas").insert({ fecha: hoyChile(), esfera, tipo, categoria, palabra, descripcion, monto_clp: monto, retencion_clp: retencion, neto_clp: neto, clasificado });
 
-    let respuesta = `${tipo === "ingreso" ? "🟢" : "🔴"} <b>${palabra}</b> ${clp(monto)}\n${esfera} · ${categoria}` +
-      (descripcion ? `\n"${descripcion}"` : "");
+    let respuesta = `${tipo === "ingreso" ? "🟢" : "🔴"} <b>${palabra}</b> ${clp(monto)}\n${esfera} · ${categoria}` + (descripcion ? `\n"${descripcion}"` : "");
     if (retencion > 0) respuesta += `\n\nRetención SII (15,25%): -${clp(retencion)}\n<b>Neto: ${clp(neto)}</b>`;
     if (!clasificado) respuesta += `\n\n⚠️ Palabra nueva, guardada en <i>otros</i>.\nUsa /pendientes para clasificarla.`;
 
