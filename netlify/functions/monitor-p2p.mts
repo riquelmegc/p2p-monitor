@@ -3,8 +3,8 @@ import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
 // Monitor multi-par / multi-exchange (CriptoYa)
-// USDT/CLP: negocio maker + arbitraje
-// BTC/CLP y ETH/CLP: estudio de arbitraje cripto
+// USDT/CLP: negocio maker (profundidad Binance) + arbitraje
+// BTC/CLP, ETH/CLP, XRP/CLP: estudio de arbitraje cripto
 // ============================================================
 
 const PARES = [
@@ -24,6 +24,10 @@ const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "0.6");
 const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5");
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
 const SELL_OPPORTUNITY_CLP = parseFloat(process.env.SELL_OPPORTUNITY_CLP ?? "0");
+
+// Profundidad Binance
+const MIN_ANUNCIO_CLP = parseFloat(process.env.MIN_ANUNCIO_CLP ?? "500000");
+const TOP_N = parseInt(process.env.TOP_N ?? "5", 10);
 
 // Exchanges chilenos con liquidez real
 const CONFIABLES = [
@@ -69,6 +73,61 @@ function mediana(nums: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
+// ============================================================
+// Profundidad real del libro P2P de Binance
+// tradeType "BUY"  = anuncios donde TU compras USDT  -> lado ask
+// tradeType "SELL" = anuncios donde TU vendes USDT   -> lado bid
+// ============================================================
+async function binanceP2P(tradeType: "BUY" | "SELL") {
+  const res = await fetch(
+    "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "Accept-Language": "es-CL,es;q=0.9",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        Origin: "https://p2p.binance.com",
+        Referer: "https://p2p.binance.com/es/trade/all-payments/USDT?fiat=CLP",
+      },
+      body: JSON.stringify({
+        fiat: "CLP",
+        asset: "USDT",
+        tradeType,
+        page: 1,
+        rows: 20,
+        transAmount: String(MIN_ANUNCIO_CLP),
+        countries: [],
+        payTypes: [],
+        proMerchantAds: false,
+        publisherType: null,
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
+
+  const j: any = await res.json();
+  const lista = (j?.data ?? [])
+    .map((d: any) => ({
+      precio: parseFloat(d?.adv?.price),
+      nick: d?.advertiser?.nickName ?? "?",
+      disponible: parseFloat(d?.adv?.surplusAmount ?? "0"),
+    }))
+    .filter((x: any) => x.precio > 0);
+
+  if (!lista.length) throw new Error(`Binance sin anuncios (${tradeType})`);
+
+  // BUY: los mejores son los mas baratos. SELL: los mejores son los mas caros.
+  lista.sort((a: any, b: any) =>
+    tradeType === "BUY" ? a.precio - b.precio : b.precio - a.precio
+  );
+
+  return lista.slice(0, TOP_N);
+}
+
 export default async () => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
   const alerts: string[] = [];
@@ -109,36 +168,79 @@ export default async () => {
       const { error: eIns } = await supabase.from("exchange_quotes").insert(rows);
       if (eIns) console.error(`insert ${par}:`, eIns.message);
 
-      // 4. Solo USDT/CLP: serie historica maker + alertas de precio
+      // 4. Solo USDT/CLP: profundidad Binance + alertas maker
       if (par === "USDT/CLP") {
         const b = all["binancep2p"];
-        if (b && b.ask > 0 && b.bid > 0) {
-          const makerPct = ((b.ask - b.bid) / b.bid) * 100;
+
+        let topBuy: any[] = [];
+        let topSell: any[] = [];
+        let medBuy = 0;
+        let medSell = 0;
+        let fuente = "binance_depth";
+
+        try {
+          [topBuy, topSell] = await Promise.all([
+            binanceP2P("BUY"),
+            binanceP2P("SELL"),
+          ]);
+          medBuy = mediana(topBuy.map((x) => x.precio));
+          medSell = mediana(topSell.map((x) => x.precio));
+        } catch (e: any) {
+          console.error("Binance profundidad fallo:", e.message);
+          fuente = "criptoya_fallback";
+          if (b && b.ask > 0 && b.bid > 0) {
+            medBuy = b.ask;
+            medSell = b.bid;
+          }
+        }
+
+        if (medBuy > 0 && medSell > 0) {
+          const makerPct = ((medBuy - medSell) / medSell) * 100;
+
           const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
-            best_buy_clp: b.ask,
-            best_sell_clp: b.bid,
-            avg_buy_clp: b.totalAsk,
-            avg_sell_clp: b.totalBid,
+            best_buy_clp: topBuy[0]?.precio ?? b?.ask ?? null,
+            best_sell_clp: topSell[0]?.precio ?? b?.bid ?? null,
+            avg_buy_clp: b?.totalAsk ?? null,
+            avg_sell_clp: b?.totalBid ?? null,
+            median_buy_clp: Number(medBuy.toFixed(2)),
+            median_sell_clp: Number(medSell.toFixed(2)),
+            buy_top: topBuy.length ? topBuy : null,
+            sell_top: topSell.length ? topSell : null,
+            fuente,
             spread_pct: Number(makerPct.toFixed(3)),
           });
           if (eSnap) console.error("p2p_snapshots insert:", eSnap.message);
 
+          resumen.push({
+            par,
+            fuente,
+            medBuy,
+            medSell,
+            makerPct: makerPct.toFixed(3),
+          });
+
           if (makerPct >= SPREAD_ALERT_PCT) {
+            const mejorBuy = topBuy[0]?.precio;
+            const mejorSell = topSell[0]?.precio;
             alerts.push(
               `🟢 <b>Margen maker Binance: ${makerPct.toFixed(2)}%</b>\n` +
-                `Mercado compra a: $${b.ask.toLocaleString("es-CL")}\n` +
-                `Mercado vende a: $${b.bid.toLocaleString("es-CL")}`
+                `Mediana compra (top ${TOP_N}): $${medBuy.toLocaleString("es-CL")}\n` +
+                `Mediana venta (top ${TOP_N}): $${medSell.toLocaleString("es-CL")}\n` +
+                (mejorBuy && mejorSell
+                  ? `Mejor visible: $${mejorBuy.toLocaleString("es-CL")} / $${mejorSell.toLocaleString("es-CL")}\n`
+                  : "") +
+                `Fuente: ${fuente}`
             );
           }
-          if (BUY_OPPORTUNITY_CLP > 0 && b.ask <= BUY_OPPORTUNITY_CLP) {
+          if (BUY_OPPORTUNITY_CLP > 0 && medBuy <= BUY_OPPORTUNITY_CLP) {
             alerts.push(
-              `🔵 <b>USDT barato: $${b.ask.toLocaleString("es-CL")}</b>\n` +
+              `🔵 <b>USDT barato: $${medBuy.toLocaleString("es-CL")}</b> (mediana)\n` +
                 `(tu objetivo: $${BUY_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
             );
           }
-          if (SELL_OPPORTUNITY_CLP > 0 && b.bid >= SELL_OPPORTUNITY_CLP) {
+          if (SELL_OPPORTUNITY_CLP > 0 && medSell >= SELL_OPPORTUNITY_CLP) {
             alerts.push(
-              `🟠 <b>Precio de venta alcanzado: $${b.bid.toLocaleString("es-CL")}</b>\n` +
+              `🟠 <b>Precio de venta alcanzado: $${medSell.toLocaleString("es-CL")}</b> (mediana)\n` +
                 `(tu objetivo: $${SELL_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
             );
           }
