@@ -3,8 +3,9 @@ import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
 // Monitor multi-par / multi-exchange (CriptoYa)
-// USDT/CLP: maker con profundidad Binance + alerta de expansion
-// BTC/CLP, ETH/CLP, XRP/CLP: estudio de arbitraje cripto
+// USDT/CLP: maker con profundidad Binance + metodos de pago
+// USDT LATAM: referencia internacional (solo recoleccion)
+// BTC/ETH/XRP CLP: estudio de arbitraje cripto
 // ============================================================
 
 const PARES = [
@@ -12,6 +13,10 @@ const PARES = [
   { par: "BTC/CLP", url: "https://criptoya.com/api/BTC/CLP/0.01" },
   { par: "ETH/CLP", url: "https://criptoya.com/api/ETH/CLP/0.1" },
   { par: "XRP/CLP", url: "https://criptoya.com/api/XRP/CLP/1000" },
+  { par: "USDT/ARS", url: "https://criptoya.com/api/USDT/ARS/100" },
+  { par: "USDT/COP", url: "https://criptoya.com/api/USDT/COP/100" },
+  { par: "USDT/PEN", url: "https://criptoya.com/api/USDT/PEN/100" },
+  { par: "USDT/VES", url: "https://criptoya.com/api/USDT/VES/100" },
 ];
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -19,8 +24,8 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_ALERT_CHAT_ID = process.env.TELEGRAM_ALERT_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID!;
 
-const SPREAD_ALERT_PCT = parseFloat(process.env.SPREAD_ALERT_PCT ?? "0.5");
-const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "0.6");
+const SPREAD_ALERT_PCT = parseFloat(process.env.SPREAD_ALERT_PCT ?? "0.45");
+const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "1.5");
 const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5");
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
 const SELL_OPPORTUNITY_CLP = parseFloat(process.env.SELL_OPPORTUNITY_CLP ?? "0");
@@ -34,6 +39,7 @@ const EXPANSION_FACTOR = parseFloat(process.env.EXPANSION_FACTOR ?? "1.25");
 const EXPANSION_MIN_PCT = parseFloat(process.env.EXPANSION_MIN_PCT ?? "0.3");
 const EXPANSION_MIN_MUESTRAS = 6;
 
+// Exchanges chilenos con liquidez real (solo para arbitraje CLP)
 const CONFIABLES = [
   "binancep2p",
   "buda",
@@ -43,6 +49,9 @@ const CONFIABLES = [
   "vitawallet",
   "orionx",
 ];
+
+// Pares que solo se recolectan, sin alertas
+const SOLO_RECOLECTAR = ["USDT/ARS", "USDT/COP", "USDT/PEN", "USDT/VES"];
 
 const MAX_DESVIO_PCT = 1.5;
 
@@ -119,6 +128,9 @@ async function binanceP2P(tradeType: "BUY" | "SELL") {
       precio: parseFloat(d?.adv?.price),
       nick: d?.advertiser?.nickName ?? "?",
       disponible: parseFloat(d?.adv?.surplusAmount ?? "0"),
+      pagos: (d?.adv?.tradeMethods ?? [])
+        .map((m: any) => m?.identifier ?? m?.tradeMethodName)
+        .filter(Boolean),
     }))
     .filter((x: any) => x.precio > 0);
 
@@ -168,6 +180,9 @@ export default async () => {
       const { error: eIns } = await supabase.from("exchange_quotes").insert(rows);
       if (eIns) console.error(`insert ${par}:`, eIns.message);
 
+      // Pares internacionales: solo se guardan, sin analisis ni alertas
+      if (SOLO_RECOLECTAR.includes(par)) continue;
+
       // ====== USDT/CLP: profundidad + alertas maker ======
       if (par === "USDT/CLP") {
         const b = all["binancep2p"];
@@ -197,7 +212,6 @@ export default async () => {
         if (medBuy > 0 && medSell > 0) {
           const makerPct = ((medBuy - medSell) / medSell) * 100;
 
-          // --- Historia de 6h (ANTES de insertar el registro nuevo) ---
           const desde = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
           const { data: hist } = await supabase
             .from("p2p_snapshots")
@@ -216,7 +230,6 @@ export default async () => {
             ? serie.reduce((s, n) => s + n, 0) / serie.length
             : null;
 
-          // --- Guardar snapshot ---
           const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
             best_buy_clp: topBuy[0]?.precio ?? b?.ask ?? null,
             best_sell_clp: topSell[0]?.precio ?? b?.bid ?? null,
