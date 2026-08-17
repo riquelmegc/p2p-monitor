@@ -6,6 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 // USDT/CLP: maker con profundidad Binance + metodos de pago
 // USDT LATAM: referencia internacional (solo recoleccion)
 // BTC/ETH/XRP CLP: estudio de arbitraje cripto
+// Consultas en paralelo para evitar timeout de Netlify
 // ============================================================
 
 const PARES = [
@@ -50,7 +51,7 @@ const CONFIABLES = [
   "orionx",
 ];
 
-// Pares que solo se recolectan, sin alertas
+// Pares que solo se recolectan, sin analisis ni alertas
 const SOLO_RECOLECTAR = ["USDT/ARS", "USDT/COP", "USDT/PEN", "USDT/VES"];
 
 const MAX_DESVIO_PCT = 1.5;
@@ -149,17 +150,38 @@ export default async () => {
   const resumen: any[] = [];
 
   try {
-    for (const { par, url } of PARES) {
-      let all: Record<string, Quote>;
+    // ====== 1. Consultar TODOS los pares en paralelo ======
+    const respuestas = await Promise.all(
+      PARES.map(async ({ par, url }) => {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return { par, all: (await res.json()) as Record<string, Quote> };
+        } catch (e: any) {
+          console.error(`Error consultando ${par}:`, e.message);
+          return { par, all: null };
+        }
+      })
+    );
 
-      try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        all = (await res.json()) as Record<string, Quote>;
-      } catch (e: any) {
-        console.error(`Error consultando ${par}:`, e.message);
-        continue;
-      }
+    // ====== 2. Profundidad Binance en paralelo tambien ======
+    let topBuy: any[] = [];
+    let topSell: any[] = [];
+    let fuente = "binance_depth";
+
+    try {
+      [topBuy, topSell] = await Promise.all([
+        binanceP2P("BUY"),
+        binanceP2P("SELL"),
+      ]);
+    } catch (e: any) {
+      console.error("Binance profundidad fallo:", e.message);
+      fuente = "criptoya_fallback";
+    }
+
+    // ====== 3. Procesar cada par ======
+    for (const { par, all } of respuestas) {
+      if (!all) continue;
 
       const valid = Object.entries(all).filter(
         ([, q]) => q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
@@ -180,33 +202,22 @@ export default async () => {
       const { error: eIns } = await supabase.from("exchange_quotes").insert(rows);
       if (eIns) console.error(`insert ${par}:`, eIns.message);
 
-      // Pares internacionales: solo se guardan, sin analisis ni alertas
+      // Pares internacionales: solo se guardan
       if (SOLO_RECOLECTAR.includes(par)) continue;
 
-      // ====== USDT/CLP: profundidad + alertas maker ======
+      // ====== USDT/CLP: medianas + alertas maker ======
       if (par === "USDT/CLP") {
         const b = all["binancep2p"];
 
-        let topBuy: any[] = [];
-        let topSell: any[] = [];
         let medBuy = 0;
         let medSell = 0;
-        let fuente = "binance_depth";
 
-        try {
-          [topBuy, topSell] = await Promise.all([
-            binanceP2P("BUY"),
-            binanceP2P("SELL"),
-          ]);
+        if (topBuy.length && topSell.length) {
           medBuy = mediana(topBuy.map((x) => x.precio));
           medSell = mediana(topSell.map((x) => x.precio));
-        } catch (e: any) {
-          console.error("Binance profundidad fallo:", e.message);
-          fuente = "criptoya_fallback";
-          if (b && b.ask > 0 && b.bid > 0) {
-            medBuy = b.ask;
-            medSell = b.bid;
-          }
+        } else if (b && b.ask > 0 && b.bid > 0) {
+          medBuy = b.ask;
+          medSell = b.bid;
         }
 
         if (medBuy > 0 && medSell > 0) {
