@@ -5,8 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 // Monitor multi-par / multi-exchange (CriptoYa)
 // USDT/CLP: maker con profundidad Binance + metodos de pago
 // USDT LATAM: referencia internacional (solo recoleccion)
-// BTC/ETH/XRP CLP: estudio de arbitraje cripto
-// Consultas en paralelo para evitar timeout de Netlify
+// Alertas: umbral fijo + expansion + recordatorio de ventana
 // ============================================================
 
 const PARES = [
@@ -40,7 +39,10 @@ const EXPANSION_FACTOR = parseFloat(process.env.EXPANSION_FACTOR ?? "1.25");
 const EXPANSION_MIN_PCT = parseFloat(process.env.EXPANSION_MIN_PCT ?? "0.3");
 const EXPANSION_MIN_MUESTRAS = 6;
 
-// Exchanges chilenos con liquidez real (solo para arbitraje CLP)
+// Recordatorio de ventana abierta: cada N ciclos consecutivos sobre umbral
+// 12 ciclos x 10 min = 2 horas
+const RECORDATORIO_CADA = parseInt(process.env.RECORDATORIO_CADA ?? "12", 10);
+
 const CONFIABLES = [
   "binancep2p",
   "buda",
@@ -51,7 +53,6 @@ const CONFIABLES = [
   "orionx",
 ];
 
-// Pares que solo se recolectan, sin analisis ni alertas
 const SOLO_RECOLECTAR = ["USDT/ARS", "USDT/COP", "USDT/PEN", "USDT/VES"];
 
 const MAX_DESVIO_PCT = 1.5;
@@ -87,11 +88,6 @@ function mediana(nums: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-// ============================================================
-// Profundidad real del libro P2P de Binance
-// tradeType "BUY"  = anuncios donde TU compras USDT  -> lado ask
-// tradeType "SELL" = anuncios donde TU vendes USDT   -> lado bid
-// ============================================================
 async function binanceP2P(tradeType: "BUY" | "SELL") {
   const res = await fetch(
     "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
@@ -150,7 +146,7 @@ export default async () => {
   const resumen: any[] = [];
 
   try {
-    // ====== 1. Consultar TODOS los pares en paralelo ======
+    // ====== 1. Todos los pares en paralelo ======
     const respuestas = await Promise.all(
       PARES.map(async ({ par, url }) => {
         try {
@@ -164,7 +160,7 @@ export default async () => {
       })
     );
 
-    // ====== 2. Profundidad Binance en paralelo tambien ======
+    // ====== 2. Profundidad Binance ======
     let topBuy: any[] = [];
     let topSell: any[] = [];
     let fuente = "binance_depth";
@@ -202,7 +198,6 @@ export default async () => {
       const { error: eIns } = await supabase.from("exchange_quotes").insert(rows);
       if (eIns) console.error(`insert ${par}:`, eIns.message);
 
-      // Pares internacionales: solo se guardan
       if (SOLO_RECOLECTAR.includes(par)) continue;
 
       // ====== USDT/CLP: medianas + alertas maker ======
@@ -223,23 +218,33 @@ export default async () => {
         if (medBuy > 0 && medSell > 0) {
           const makerPct = ((medBuy - medSell) / medSell) * 100;
 
-          const desde = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+          const desde = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
           const { data: hist } = await supabase
             .from("p2p_snapshots")
             .select("spread_pct")
             .eq("fuente", "binance_depth")
             .gte("created_at", desde)
             .order("created_at", { ascending: false })
-            .limit(40);
+            .limit(60);
 
           const serie = (hist ?? [])
             .map((h: any) => Number(h.spread_pct))
             .filter((n) => !isNaN(n));
 
           const previo = serie.length ? serie[0] : null;
-          const promedio6h = serie.length
-            ? serie.reduce((s, n) => s + n, 0) / serie.length
+
+          // Promedio 6h = primeras 36 muestras (36 x 10min)
+          const serie6h = serie.slice(0, 36);
+          const promedio6h = serie6h.length
+            ? serie6h.reduce((s, n) => s + n, 0) / serie6h.length
             : null;
+
+          // Cuantos ciclos consecutivos (hacia atras) estuvieron sobre umbral
+          let rachaPrevia = 0;
+          for (const v of serie) {
+            if (v >= SPREAD_ALERT_PCT) rachaPrevia++;
+            else break;
+          }
 
           const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
             best_buy_clp: topBuy[0]?.precio ?? b?.ask ?? null,
@@ -255,18 +260,20 @@ export default async () => {
           });
           if (eSnap) console.error("p2p_snapshots insert:", eSnap.message);
 
+          const sobreUmbral = makerPct >= SPREAD_ALERT_PCT;
+          const rachaActual = sobreUmbral ? rachaPrevia + 1 : 0;
+
           resumen.push({
             par,
             fuente,
             makerPct: makerPct.toFixed(3),
             promedio6h: promedio6h ? promedio6h.toFixed(3) : null,
-            muestras: serie.length,
+            racha: rachaActual,
           });
 
-          // --- ALERTA 1: umbral fijo (solo flanco de subida) ---
+          // --- ALERTA 1: cruce de umbral ---
           const cruzoUmbral =
-            makerPct >= SPREAD_ALERT_PCT &&
-            (previo === null || previo < SPREAD_ALERT_PCT);
+            sobreUmbral && (previo === null || previo < SPREAD_ALERT_PCT);
 
           if (cruzoUmbral) {
             alerts.push(
@@ -277,10 +284,26 @@ export default async () => {
             );
           }
 
+          // --- ALERTA 3: recordatorio de ventana abierta ---
+          if (
+            !cruzoUmbral &&
+            sobreUmbral &&
+            rachaActual > 0 &&
+            rachaActual % RECORDATORIO_CADA === 0
+          ) {
+            const horas = ((rachaActual * 10) / 60).toFixed(1);
+            alerts.push(
+              `🔔 <b>Ventana sigue abierta — ${horas}h</b>\n` +
+                `Margen actual: <b>${makerPct.toFixed(2)}%</b>\n` +
+                `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}\n` +
+                `Lleva ${rachaActual} ciclos sobre ${SPREAD_ALERT_PCT}%`
+            );
+          }
+
           // --- ALERTA 2: expansion sobre promedio 6h ---
           if (
             promedio6h !== null &&
-            serie.length >= EXPANSION_MIN_MUESTRAS &&
+            serie6h.length >= EXPANSION_MIN_MUESTRAS &&
             makerPct >= EXPANSION_MIN_PCT
           ) {
             const gatillo = promedio6h * EXPANSION_FACTOR;
@@ -292,7 +315,7 @@ export default async () => {
               alerts.push(
                 `📈 <b>Expansión del spread</b>\n` +
                   `Ahora: <b>${makerPct.toFixed(2)}%</b>\n` +
-                  `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie.length} muestras)\n` +
+                  `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie6h.length} muestras)\n` +
                   `Está ${veces}× sobre lo normal\n` +
                   `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}`
               );
@@ -314,7 +337,7 @@ export default async () => {
         }
       }
 
-      // ====== Arbitraje con filtro anti-outlier ======
+      // ====== Arbitraje ======
       const candidatos = valid.filter(
         ([name, q]) => CONFIABLES.includes(name) && q.totalBid < q.totalAsk
       );
