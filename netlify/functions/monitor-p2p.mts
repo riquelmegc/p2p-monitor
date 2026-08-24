@@ -3,8 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 
 // ============================================================
 // Monitor multi-par / multi-exchange (CriptoYa)
-// USDT/CLP: maker con profundidad Binance + metodos de pago
-// USDT LATAM: referencia internacional (solo recoleccion)
+// USDT/CLP: dos segmentos de mercado (grande $500k / chico $100k)
 // Alertas: umbral fijo + expansion + recordatorio de ventana
 // ============================================================
 
@@ -30,8 +29,9 @@ const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
 const SELL_OPPORTUNITY_CLP = parseFloat(process.env.SELL_OPPORTUNITY_CLP ?? "0");
 
-// Profundidad Binance
-const MIN_ANUNCIO_CLP = parseFloat(process.env.MIN_ANUNCIO_CLP ?? "500000");
+// Dos segmentos de mercado
+const MONTO_GRANDE = parseFloat(process.env.MONTO_GRANDE ?? "500000");
+const MONTO_CHICO = parseFloat(process.env.MONTO_CHICO ?? "100000");
 const TOP_N = parseInt(process.env.TOP_N ?? "5", 10);
 
 // Alerta de expansion
@@ -39,8 +39,7 @@ const EXPANSION_FACTOR = parseFloat(process.env.EXPANSION_FACTOR ?? "1.25");
 const EXPANSION_MIN_PCT = parseFloat(process.env.EXPANSION_MIN_PCT ?? "0.3");
 const EXPANSION_MIN_MUESTRAS = 6;
 
-// Recordatorio de ventana abierta: cada N ciclos consecutivos sobre umbral
-// 12 ciclos x 10 min = 2 horas
+// Recordatorio de ventana: cada N ciclos (12 x 10min = 2h)
 const RECORDATORIO_CADA = parseInt(process.env.RECORDATORIO_CADA ?? "12", 10);
 
 const CONFIABLES = [
@@ -88,7 +87,10 @@ function mediana(nums: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-async function binanceP2P(tradeType: "BUY" | "SELL") {
+// ============================================================
+// Libro P2P de Binance para un monto (segmento) especifico
+// ============================================================
+async function binanceP2P(tradeType: "BUY" | "SELL", transAmount: number) {
   const res = await fetch(
     "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
     {
@@ -108,7 +110,7 @@ async function binanceP2P(tradeType: "BUY" | "SELL") {
         tradeType,
         page: 1,
         rows: 20,
-        transAmount: String(MIN_ANUNCIO_CLP),
+        transAmount: String(transAmount),
         countries: [],
         payTypes: [],
         proMerchantAds: false,
@@ -125,13 +127,15 @@ async function binanceP2P(tradeType: "BUY" | "SELL") {
       precio: parseFloat(d?.adv?.price),
       nick: d?.advertiser?.nickName ?? "?",
       disponible: parseFloat(d?.adv?.surplusAmount ?? "0"),
+      min: parseFloat(d?.adv?.minSingleTransAmount ?? "0"),
+      max: parseFloat(d?.adv?.maxSingleTransAmount ?? "0"),
       pagos: (d?.adv?.tradeMethods ?? [])
         .map((m: any) => m?.identifier ?? m?.tradeMethodName)
         .filter(Boolean),
     }))
     .filter((x: any) => x.precio > 0);
 
-  if (!lista.length) throw new Error(`Binance sin anuncios (${tradeType})`);
+  if (!lista.length) throw new Error(`Binance sin anuncios (${tradeType}/${transAmount})`);
 
   lista.sort((a: any, b: any) =>
     tradeType === "BUY" ? a.precio - b.precio : b.precio - a.precio
@@ -146,7 +150,7 @@ export default async () => {
   const resumen: any[] = [];
 
   try {
-    // ====== 1. Todos los pares en paralelo ======
+    // ====== 1. Pares CriptoYa en paralelo ======
     const respuestas = await Promise.all(
       PARES.map(async ({ par, url }) => {
         try {
@@ -160,19 +164,30 @@ export default async () => {
       })
     );
 
-    // ====== 2. Profundidad Binance ======
+    // ====== 2. Binance: dos segmentos, cuatro consultas en paralelo ======
     let topBuy: any[] = [];
     let topSell: any[] = [];
+    let topBuyChico: any[] = [];
+    let topSellChico: any[] = [];
     let fuente = "binance_depth";
 
     try {
       [topBuy, topSell] = await Promise.all([
-        binanceP2P("BUY"),
-        binanceP2P("SELL"),
+        binanceP2P("BUY", MONTO_GRANDE),
+        binanceP2P("SELL", MONTO_GRANDE),
       ]);
     } catch (e: any) {
-      console.error("Binance profundidad fallo:", e.message);
+      console.error("Binance segmento grande fallo:", e.message);
       fuente = "criptoya_fallback";
+    }
+
+    try {
+      [topBuyChico, topSellChico] = await Promise.all([
+        binanceP2P("BUY", MONTO_CHICO),
+        binanceP2P("SELL", MONTO_CHICO),
+      ]);
+    } catch (e: any) {
+      console.error("Binance segmento chico fallo:", e.message);
     }
 
     // ====== 3. Procesar cada par ======
@@ -200,7 +215,7 @@ export default async () => {
 
       if (SOLO_RECOLECTAR.includes(par)) continue;
 
-      // ====== USDT/CLP: medianas + alertas maker ======
+      // ====== USDT/CLP ======
       if (par === "USDT/CLP") {
         const b = all["binancep2p"];
 
@@ -213,6 +228,19 @@ export default async () => {
         } else if (b && b.ask > 0 && b.bid > 0) {
           medBuy = b.ask;
           medSell = b.bid;
+        }
+
+        // Segmento chico
+        let medBuyCh = 0;
+        let medSellCh = 0;
+        let makerPctCh: number | null = null;
+
+        if (topBuyChico.length && topSellChico.length) {
+          medBuyCh = mediana(topBuyChico.map((x) => x.precio));
+          medSellCh = mediana(topSellChico.map((x) => x.precio));
+          if (medBuyCh > 0 && medSellCh > 0) {
+            makerPctCh = ((medBuyCh - medSellCh) / medSellCh) * 100;
+          }
         }
 
         if (medBuy > 0 && medSell > 0) {
@@ -233,13 +261,11 @@ export default async () => {
 
           const previo = serie.length ? serie[0] : null;
 
-          // Promedio 6h = primeras 36 muestras (36 x 10min)
           const serie6h = serie.slice(0, 36);
           const promedio6h = serie6h.length
             ? serie6h.reduce((s, n) => s + n, 0) / serie6h.length
             : null;
 
-          // Cuantos ciclos consecutivos (hacia atras) estuvieron sobre umbral
           let rachaPrevia = 0;
           for (const v of serie) {
             if (v >= SPREAD_ALERT_PCT) rachaPrevia++;
@@ -255,6 +281,11 @@ export default async () => {
             median_sell_clp: Number(medSell.toFixed(2)),
             buy_top: topBuy.length ? topBuy : null,
             sell_top: topSell.length ? topSell : null,
+            median_buy_chico: medBuyCh > 0 ? Number(medBuyCh.toFixed(2)) : null,
+            median_sell_chico: medSellCh > 0 ? Number(medSellCh.toFixed(2)) : null,
+            spread_pct_chico: makerPctCh !== null ? Number(makerPctCh.toFixed(3)) : null,
+            buy_top_chico: topBuyChico.length ? topBuyChico : null,
+            sell_top_chico: topSellChico.length ? topSellChico : null,
             fuente,
             spread_pct: Number(makerPct.toFixed(3)),
           });
@@ -263,11 +294,17 @@ export default async () => {
           const sobreUmbral = makerPct >= SPREAD_ALERT_PCT;
           const rachaActual = sobreUmbral ? rachaPrevia + 1 : 0;
 
+          // Linea extra para las alertas: segmento chico
+          const lineaChico =
+            makerPctCh !== null
+              ? `\n<i>Segmento chico ($${MONTO_CHICO.toLocaleString("es-CL")}): ${makerPctCh.toFixed(2)}% · $${medBuyCh.toLocaleString("es-CL")} / $${medSellCh.toLocaleString("es-CL")}</i>`
+              : "";
+
           resumen.push({
             par,
             fuente,
-            makerPct: makerPct.toFixed(3),
-            promedio6h: promedio6h ? promedio6h.toFixed(3) : null,
+            grande: makerPct.toFixed(3),
+            chico: makerPctCh !== null ? makerPctCh.toFixed(3) : null,
             racha: rachaActual,
           });
 
@@ -280,11 +317,12 @@ export default async () => {
               `🟢 <b>Margen maker: ${makerPct.toFixed(2)}%</b>\n` +
                 `Compra (mediana top ${TOP_N}): $${medBuy.toLocaleString("es-CL")}\n` +
                 `Venta (mediana top ${TOP_N}): $${medSell.toLocaleString("es-CL")}\n` +
-                `Umbral: ${SPREAD_ALERT_PCT}% · Fuente: ${fuente}`
+                `Umbral: ${SPREAD_ALERT_PCT}% · Fuente: ${fuente}` +
+                lineaChico
             );
           }
 
-          // --- ALERTA 3: recordatorio de ventana abierta ---
+          // --- ALERTA 3: recordatorio de ventana ---
           if (
             !cruzoUmbral &&
             sobreUmbral &&
@@ -296,11 +334,12 @@ export default async () => {
               `🔔 <b>Ventana sigue abierta — ${horas}h</b>\n` +
                 `Margen actual: <b>${makerPct.toFixed(2)}%</b>\n` +
                 `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}\n` +
-                `Lleva ${rachaActual} ciclos sobre ${SPREAD_ALERT_PCT}%`
+                `Lleva ${rachaActual} ciclos sobre ${SPREAD_ALERT_PCT}%` +
+                lineaChico
             );
           }
 
-          // --- ALERTA 2: expansion sobre promedio 6h ---
+          // --- ALERTA 2: expansion ---
           if (
             promedio6h !== null &&
             serie6h.length >= EXPANSION_MIN_MUESTRAS &&
@@ -317,7 +356,8 @@ export default async () => {
                   `Ahora: <b>${makerPct.toFixed(2)}%</b>\n` +
                   `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie6h.length} muestras)\n` +
                   `Está ${veces}× sobre lo normal\n` +
-                  `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}`
+                  `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}` +
+                  lineaChico
               );
             }
           }
