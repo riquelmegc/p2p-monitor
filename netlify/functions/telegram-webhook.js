@@ -8,6 +8,8 @@ const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 const RETENCION_UBER = 0.1525;
 const IMPUESTO_P2P = 0.20;
+const LIMITE_NUEVO = 200000;
+const META_MAKER = 20;
 
 async function reply(text) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -30,9 +32,28 @@ function normalizar(s) {
 }
 
 function limiteSugerido(ops) {
-  if (ops <= 0) return 250000;
+  if (ops <= 0) return LIMITE_NUEVO;
   if (ops <= 2) return 2000000;
   return 5000000;
+}
+
+// Monto en pesos: acepta 50000, 50.000, 49433.79, 49433,79 y 49.433,79
+function parseCLP(s) {
+  s = (s || "").replace(/\$/g, "");
+  if (/^\d{1,3}([.,]\d{3})+$/.test(s)) return parseFloat(s.replace(/[.,]/g, ""));
+  if (s.includes(".") && s.includes(",")) return parseFloat(s.replace(/\./g, "").replace(",", "."));
+  return parseFloat(s.replace(",", "."));
+}
+
+// Monto en USDT: acepta 51.93 y 51,93
+function parseUSDT(s) {
+  return parseFloat((s || "").replace(",", "."));
+}
+
+async function ordenes30d(supabase) {
+  const desde = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+  const { count } = await supabase.from("ordenes_p2p").select("id", { count: "exact", head: true }).gte("created_at", desde);
+  return count ?? 0;
 }
 
 const AYUDA =
@@ -48,9 +69,12 @@ const AYUDA =
   "  /hoy /mes /uber\n" +
   "  /pendientes /diccionario\n" +
   "  /agregar palabra esfera tipo categoria\n\n" +
+  "<b>Órdenes P2P:</b>\n" +
+  "  <code>/compra nick pesos usdt banco</code>\n" +
+  "  <code>/venta nick pesos usdt banco</code>\n" +
+  "  /ganancia — ganancia, stock y avance a 20\n\n" +
   "<b>Contrapartes P2P:</b>\n" +
   "  /check nickname\n" +
-  "  /reg nickname monto ganancia [banco]\n" +
   "  /bloquear /ok /top /impuesto";
 
 export default async (req) => {
@@ -208,7 +232,7 @@ export default async (req) => {
       const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
       const c = rows && rows[0];
       if (!c) {
-        await reply(`🔴 <b>NUEVO</b> — ${nick}\n\nSin historial.\nLímite máximo: <b>${clp(250000)}</b>\n\n⚠️ Verificar pago desde cuenta a su nombre.`);
+        await reply(`🔴 <b>NUEVO</b> — ${nick}\n\nSin historial.\nLímite máximo: <b>${clp(LIMITE_NUEVO)}</b>\n\n⚠️ Verificar pago desde cuenta a su nombre.`);
       } else if (c.confiable === false) {
         await reply(`⛔ <b>BLOQUEADO</b> — ${c.nickname}\n\nMotivo: ${c.notas ?? "sin nota"}\n\n<b>NO OPERAR</b>`);
       } else {
@@ -217,13 +241,96 @@ export default async (req) => {
       return new Response("ok");
     }
 
+    // ── Órdenes P2P: /compra y /venta escriben en ordenes_p2p ──
+    if (primera === "/compra" || primera === "/venta") {
+      const tipo = primera === "/compra" ? "compra" : "venta";
+      const nick = (partes[1] || "").toLowerCase();
+      const monto = parseCLP(partes[2]);
+      const usdt = parseUSDT(partes[3]);
+      const banco = partes.slice(4).join(" ").toLowerCase() || null;
+      if (!nick || !(monto > 0) || !(usdt > 0)) {
+        await reply(`Uso: <code>${primera} nick pesos usdt banco</code>\nEj: <code>${primera} finansmart 50000 51.93 mercadopago</code>`);
+        return new Response("ok");
+      }
+
+      const { data: ins, error } = await supabase
+        .from("ordenes_p2p")
+        .insert({ tipo, nickname: nick, banco, monto_clp: monto, usdt })
+        .select("id,precio_efectivo")
+        .single();
+      if (error) throw new Error(error.message);
+
+      let ganancia = null;
+      if (tipo === "venta") {
+        const { data: g } = await supabase.from("ganancias_p2p").select("ganancia_clp").eq("id", ins.id).single();
+        ganancia = Math.round(Number(g?.ganancia_clp ?? 0));
+        await supabase.from("impuesto_apartado").insert({
+          fecha: hoyChile(), nickname: nick, monto_operado_clp: monto,
+          ganancia_clp: ganancia, impuesto_clp: Math.round(ganancia * IMPUESTO_P2P),
+        });
+      }
+
+      const { data: rows } = await supabase.from("contrapartes").select("*").ilike("nickname", nick).limit(1);
+      const c = rows && rows[0];
+      let ops = 1;
+      let aviso = "";
+      if (c) {
+        ops = c.total_operaciones + 1;
+        if (c.confiable === false) aviso = "\n⛔ <b>Ojo: esta contraparte está bloqueada.</b>";
+        await supabase.from("contrapartes").update({
+          total_operaciones: ops,
+          monto_acumulado_clp: Number(c.monto_acumulado_clp) + monto,
+          ganancia_acumulada_clp: Number(c.ganancia_acumulada_clp || 0) + (ganancia ?? 0),
+          ultima_operacion: hoyChile(),
+          banco: banco ?? c.banco,
+        }).eq("id", c.id);
+      } else {
+        await supabase.from("contrapartes").insert({
+          nickname: nick, banco, total_operaciones: 1, monto_acumulado_clp: monto,
+          ganancia_acumulada_clp: ganancia ?? 0, primera_operacion: hoyChile(), ultima_operacion: hoyChile(),
+        });
+      }
+
+      const n = await ordenes30d(supabase);
+      let texto = `${tipo === "compra" ? "🟦 <b>Compra</b>" : "🟧 <b>Venta</b>"} registrada — ${nick}${c ? "" : " (nueva)"}\n` +
+        `${clp(monto)} · ${usdt.toFixed(2)} USDT\nPrecio efectivo: ${Number(ins.precio_efectivo).toLocaleString("es-CL")}` +
+        (banco ? `\nBanco: ${banco}` : "");
+      if (ganancia !== null) texto += `\n\n${ganancia >= 0 ? "🟢" : "🔴"} Ganancia: <b>${clp(ganancia)}</b>\n💰 Apartado impuesto: ${clp(Math.max(0, ganancia * IMPUESTO_P2P))}`;
+      texto += `\n\nOperaciones con ${nick}: ${ops} · límite: ${clp(limiteSugerido(ops))}`;
+      texto += `\n📈 Órdenes 30 días: <b>${n} de ${META_MAKER}</b>` + (n >= META_MAKER ? " ✅ ¡Meta maker!" : "");
+      await reply(texto + aviso);
+      return new Response("ok");
+    }
+
+    if (primera === "/ganancia") {
+      const { data } = await supabase.from("ganancias_p2p").select("*").order("created_at").order("id");
+      const lista = data ?? [];
+      if (!lista.length) { await reply("Aún no hay órdenes registradas."); return new Response("ok"); }
+      const ventas = lista.filter((o) => o.tipo === "venta");
+      const total = ventas.reduce((s, o) => s + Number(o.ganancia_clp || 0), 0);
+      const hoy = hoyChile();
+      const hoyGan = ventas
+        .filter((o) => new Date(new Date(o.created_at).getTime() - 4 * 3600 * 1000).toISOString().slice(0, 10) === hoy)
+        .reduce((s, o) => s + Number(o.ganancia_clp || 0), 0);
+      const ult = lista[lista.length - 1];
+      const n = await ordenes30d(supabase);
+      await reply(
+        `📊 <b>Ganancia P2P</b>\n\n` +
+        `Hoy: <b>${clp(hoyGan)}</b>\nTotal: <b>${clp(total)}</b> (${ventas.length} ventas)\n\n` +
+        `Stock: ${Number(ult.stock_usdt || 0).toFixed(2)} USDT\nCosto promedio: ${Number(ult.costo_promedio_clp || 0).toLocaleString("es-CL")}\n\n` +
+        `📈 Órdenes 30 días: <b>${n} de ${META_MAKER}</b>`
+      );
+      return new Response("ok");
+    }
+
+    // /reg queda por compatibilidad; lo nuevo es /compra y /venta
     if (primera === "/reg") {
       const nick = partes[1];
       const monto = parseFloat((partes[2] ?? "").replace(/[.,]/g, ""));
       const ganancia = parseFloat((partes[3] ?? "").replace(/[.,]/g, ""));
       const banco = partes.slice(4).join(" ") || null;
       if (!nick || isNaN(monto) || monto <= 0 || isNaN(ganancia)) {
-        await reply("Uso: <code>/reg nickname monto ganancia [banco]</code>\nEj: <code>/reg juanito 200000 4000 mercadopago</code>");
+        await reply("Uso: <code>/reg nickname monto ganancia [banco]</code>\n\n👉 Mejor usa <code>/compra</code> o <code>/venta</code>: registran la orden y calculan la ganancia solos.");
         return new Response("ok");
       }
       const impuesto = Math.round(ganancia * IMPUESTO_P2P);
@@ -280,7 +387,7 @@ export default async (req) => {
       if (!lista.length) { await reply("Aún no has registrado operaciones con ganancia."); return new Response("ok"); }
       const totalOp = lista.reduce((s, r) => s + Number(r.monto_operado_clp), 0);
       const totalGan = lista.reduce((s, r) => s + Number(r.ganancia_clp), 0);
-      const totalImp = lista.reduce((s, r) => s + Number(r.impuesto_clp), 0);
+      const totalImp = Math.max(0, lista.reduce((s, r) => s + Number(r.impuesto_clp), 0));
       await reply(`🧾 <b>Impuesto apartado</b>\n\nOperaciones: ${lista.length}\nVolumen operado: ${clp(totalOp)}\nGanancia total: ${clp(totalGan)}\n\n<b>💰 Apartado para SII (20%): ${clp(totalImp)}</b>\n<i>No tocar este dinero.</i>`);
       return new Response("ok");
     }
