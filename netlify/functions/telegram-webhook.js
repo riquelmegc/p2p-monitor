@@ -115,7 +115,9 @@ const AYUDA =
   "<b>Órdenes P2P:</b>\n" +
   "  <code>/compra nick pesos usdt banco</code>\n" +
   "  <code>/venta nick pesos usdt banco</code>\n" +
-  "  /ganancia — ganancia, stock y avance a 20\n\n" +
+  "  /ganancia — ganancia, stock y avance a 20\n" +
+  "  /capital — saldo en USDT y en pesos\n" +
+  "  <code>/capital ajustar 9500000</code> — corrige los pesos (depósitos/retiros)\n\n" +
   "<b>Vouchers (fotos):</b>\n" +
   "  Foto con el /compra o /venta como texto → registra y guarda\n" +
   "  Foto sin texto → se agrega a la última orden\n" +
@@ -387,6 +389,39 @@ export default async (req) => {
       texto += `\n\nOperaciones con ${nick}: ${ops} · límite: ${clp(limiteSugerido(ops))}`;
       texto += `\n📈 Órdenes 30 días: <b>${n} de ${META_MAKER}</b>` + (n >= META_MAKER ? " ✅ ¡Meta maker!" : "");
       await reply(texto + aviso);
+      return new Response("ok");
+    }
+
+    if (primera === "/capital") {
+      if ((partes[1] || "").toLowerCase() === "ajustar") {
+        const nuevo = parseCLP(partes[2]);
+        if (!(nuevo >= 0)) { await reply("Uso: <code>/capital ajustar 9500000</code>\nPon los pesos que tienes HOY para operar."); return new Response("ok"); }
+        const { data: ult } = await supabase.from("ordenes_p2p").select("id").order("id", { ascending: false }).limit(1);
+        const ultId = ult?.[0]?.id ?? 0;
+        await supabase.from("config_p2p").upsert([
+          { clave: "clp_inicial", valor: nuevo, nota: `Ajustado por Telegram ${hoyChile()}`, updated_at: new Date().toISOString() },
+          { clave: "clp_desde_orden_id", valor: ultId, nota: `Ajustado por Telegram ${hoyChile()}`, updated_at: new Date().toISOString() },
+        ]);
+        await reply(`✅ Pesos para operar ajustados a <b>${clp(nuevo)}</b>.`);
+        return new Response("ok");
+      }
+      const { data: cfg } = await supabase.from("config_p2p").select("clave,valor");
+      const val = (k) => Number(cfg?.find((c) => c.clave === k)?.valor ?? 0);
+      const { data: ords } = await supabase.from("ordenes_p2p").select("tipo,monto_clp").gt("id", val("clp_desde_orden_id")).neq("nickname", STOCK_INICIAL);
+      let pesos = val("clp_inicial");
+      for (const o of ords ?? []) pesos += o.tipo === "venta" ? Number(o.monto_clp) : -Number(o.monto_clp);
+      const { data: g } = await supabase.from("ganancias_p2p").select("stock_usdt,costo_promedio_clp").order("created_at").order("id");
+      const ult = g?.[g.length - 1] ?? {};
+      const stock = Number(ult.stock_usdt || 0);
+      const costo = Number(ult.costo_promedio_clp || 0);
+      const valorUsdt = stock * costo;
+      await reply(
+        `💼 <b>Capital P2P</b>\n\n` +
+        `USDT: <b>${stock.toFixed(2)}</b> (costo prom. ${costo.toLocaleString("es-CL")})\n` +
+        `   ≈ ${clp(valorUsdt)} a costo\n` +
+        `Pesos: <b>${clp(pesos)}</b>\n\n` +
+        `━━━━━━━━\n<b>TOTAL a costo: ${clp(valorUsdt + pesos)}</b>`
+      );
       return new Response("ok");
     }
 
