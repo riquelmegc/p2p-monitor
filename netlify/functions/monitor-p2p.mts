@@ -4,7 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 // ============================================================
 // Monitor multi-par / multi-exchange (CriptoYa)
 // USDT/CLP: dos segmentos de mercado (grande $500k / chico $100k)
-// Alertas: umbral fijo + expansion + recordatorio de ventana
+// Alertas MAKER: ventana abierta / cerrada / recordatorio, con
+// margen NETO (descontada la comision maker) y precios sugeridos.
 // ============================================================
 
 const PARES = [
@@ -23,7 +24,10 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_ALERT_CHAT_ID = process.env.TELEGRAM_ALERT_CHAT_ID ?? process.env.TELEGRAM_CHAT_ID!;
 
-const SPREAD_ALERT_PCT = parseFloat(process.env.SPREAD_ALERT_PCT ?? "0.45");
+// --- Maker: comision por lado y margen neto minimo para avisar ---
+const MAKER_FEE_PCT = parseFloat(process.env.MAKER_FEE_PCT ?? "0.2"); // 0,2% por lado (anuncio)
+const MAKER_NET_MIN_PCT = parseFloat(process.env.MAKER_NET_MIN_PCT ?? "0.35"); // neto minimo por ciclo
+
 const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "1.5");
 const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5");
 const BUY_OPPORTUNITY_CLP = parseFloat(process.env.BUY_OPPORTUNITY_CLP ?? "0");
@@ -34,13 +38,17 @@ const MONTO_GRANDE = parseFloat(process.env.MONTO_GRANDE ?? "500000");
 const MONTO_CHICO = parseFloat(process.env.MONTO_CHICO ?? "100000");
 const TOP_N = parseInt(process.env.TOP_N ?? "5", 10);
 
-// Alerta de expansion
+// Alerta de expansion (bruta, sin comision): apagada por defecto porque avisaba margenes que no rinden
+const EXPANSION_ACTIVA = (process.env.EXPANSION_ACTIVA ?? "false") === "true";
 const EXPANSION_FACTOR = parseFloat(process.env.EXPANSION_FACTOR ?? "1.25");
 const EXPANSION_MIN_PCT = parseFloat(process.env.EXPANSION_MIN_PCT ?? "0.3");
 const EXPANSION_MIN_MUESTRAS = 6;
 
 // Recordatorio de ventana: cada N ciclos (12 x 10min = 2h)
 const RECORDATORIO_CADA = parseInt(process.env.RECORDATORIO_CADA ?? "12", 10);
+
+// Tiempo maximo por consulta externa (evita que una API lenta bloquee todo)
+const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS ?? "8000", 10);
 
 const CONFIABLES = [
   "binancep2p",
@@ -51,6 +59,9 @@ const CONFIABLES = [
   "vitawallet",
   "orionx",
 ];
+
+// Exchanges que nunca se consideran (ni arbitraje ni registro)
+const EXCLUIR = ["bingx", "bingxp2p"];
 
 const SOLO_RECOLECTAR = ["USDT/ARS", "USDT/COP", "USDT/PEN", "USDT/VES"];
 
@@ -74,6 +85,7 @@ async function sendTelegram(text: string) {
       text,
       parse_mode: "HTML",
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const detalle = await res.text();
@@ -85,6 +97,19 @@ function mediana(nums: number[]): number {
   const s = [...nums].sort((a, b) => a - b);
   const m = Math.floor(s.length / 2);
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function r2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function fmt(n: number): string {
+  return n.toLocaleString("es-CL", { maximumFractionDigits: 2 });
+}
+
+// Margen neto de un ciclo maker (compra + venta), descontando la comision de ambos lados
+function netoMaker(spreadPct: number): number {
+  return spreadPct - 2 * MAKER_FEE_PCT;
 }
 
 // ============================================================
@@ -116,6 +141,7 @@ async function binanceP2P(tradeType: "BUY" | "SELL", transAmount: number) {
         proMerchantAds: false,
         publisherType: null,
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     }
   );
 
@@ -144,17 +170,89 @@ async function binanceP2P(tradeType: "BUY" | "SELL", transAmount: number) {
   return lista.slice(0, TOP_N);
 }
 
+// ============================================================
+// Evaluacion maker de un segmento
+//   topB: anuncios donde la gente COMPRA (ahi compite tu anuncio de VENTA), mas barato primero
+//   topS: anuncios donde la gente VENDE (ahi compite tu anuncio de COMPRA), mas caro primero
+//   serie: spreads brutos de ciclos anteriores de ESTE segmento (mas reciente primero)
+// ============================================================
+function evaluarSegmento(
+  etiqueta: string,
+  spreadPct: number,
+  serie: (number | null)[],
+  topB: any[],
+  topS: any[],
+  medB: number,
+  medS: number
+): string[] {
+  const out: string[] = [];
+  const neto = netoMaker(spreadPct);
+  const abierta = neto >= MAKER_NET_MIN_PCT;
+
+  const previo = serie.length && serie[0] !== null ? netoMaker(serie[0] as number) : null;
+  const previaAbierta = previo !== null && previo >= MAKER_NET_MIN_PCT;
+
+  let racha = 0;
+  for (const v of serie) {
+    if (v !== null && netoMaker(v) >= MAKER_NET_MIN_PCT) racha++;
+    else break;
+  }
+  const rachaActual = abierta ? racha + 1 : 0;
+
+  // Precios sugeridos para tus anuncios
+  const ventaComp = r2(topB[0].precio - 0.01);
+  const compraComp = r2(topS[0].precio + 0.01);
+  const netComp = netoMaker(((ventaComp - compraComp) / compraComp) * 100);
+  const ventaMed = r2(medB - 0.01);
+  const compraMed = r2(medS + 0.01);
+  const netMed = netoMaker(((ventaMed - compraMed) / compraMed) * 100);
+
+  const lineasPrecios =
+    `Precios para tus anuncios:\n` +
+    (netComp >= MAKER_NET_MIN_PCT
+      ? `• <b>Primer lugar</b>: venta $${fmt(ventaComp)} / compra $${fmt(compraComp)} → neto ${netComp.toFixed(2)}%\n`
+      : `• Primer lugar: venta $${fmt(ventaComp)} / compra $${fmt(compraComp)} → neto ${netComp.toFixed(2)}% ❌ no rinde\n`) +
+    `• <b>Precio medio</b> (se llena más lento): venta $${fmt(ventaMed)} / compra $${fmt(compraMed)} → neto ${netMed.toFixed(2)}%`;
+
+  const cabecera =
+    `Spread: ${spreadPct.toFixed(2)}% · Comisión: −${(2 * MAKER_FEE_PCT).toFixed(2)}%\n` +
+    `Neto: <b>${neto.toFixed(2)}%</b> (mínimo ${MAKER_NET_MIN_PCT}%)`;
+
+  if (abierta && !previaAbierta) {
+    out.push(
+      `🟢 <b>Ventana maker ABIERTA — ${etiqueta}</b>\n` +
+        `${cabecera}\n\n${lineasPrecios}\n\n` +
+        `👉 Pon tus anuncios <b>en línea</b> si puedes estar atento.`
+    );
+  } else if (abierta && rachaActual > 1 && rachaActual % RECORDATORIO_CADA === 0) {
+    const horas = ((rachaActual * 10) / 60).toFixed(1);
+    out.push(
+      `🔔 <b>Ventana maker sigue abierta — ${etiqueta} (${horas}h)</b>\n` +
+        `${cabecera}\n\n${lineasPrecios}\n\n` +
+        `Revisa que tus precios sigan competitivos.`
+    );
+  } else if (!abierta && previaAbierta) {
+    out.push(
+      `🔴 <b>Ventana maker CERRADA — ${etiqueta}</b>\n` +
+        `${cabecera}\n\n` +
+        `👉 <b>Apaga tus anuncios</b> (ya no cubre la comisión).`
+    );
+  }
+
+  return out;
+}
+
 export default async () => {
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
   const alerts: string[] = [];
   const resumen: any[] = [];
 
   try {
-    // ====== 1. Pares CriptoYa en paralelo ======
+    // ====== 1. Pares CriptoYa en paralelo (cada uno con timeout propio) ======
     const respuestas = await Promise.all(
       PARES.map(async ({ par, url }) => {
         try {
-          const res = await fetch(url);
+          const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return { par, all: (await res.json()) as Record<string, Quote> };
         } catch (e: any) {
@@ -195,7 +293,9 @@ export default async () => {
       if (!all) continue;
 
       const valid = Object.entries(all).filter(
-        ([, q]) => q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
+        ([name, q]) =>
+          !EXCLUIR.includes(name.toLowerCase()) &&
+          q && q.ask > 0 && q.bid > 0 && q.totalAsk > 0 && q.totalBid > 0
       );
       if (!valid.length) {
         console.error(`${par}: sin cotizaciones validas`);
@@ -249,28 +349,18 @@ export default async () => {
           const desde = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
           const { data: hist } = await supabase
             .from("p2p_snapshots")
-            .select("spread_pct")
+            .select("spread_pct,spread_pct_chico")
             .eq("fuente", "binance_depth")
             .gte("created_at", desde)
             .order("created_at", { ascending: false })
             .limit(60);
 
-          const serie = (hist ?? [])
-            .map((h: any) => Number(h.spread_pct))
-            .filter((n) => !isNaN(n));
-
-          const previo = serie.length ? serie[0] : null;
-
-          const serie6h = serie.slice(0, 36);
-          const promedio6h = serie6h.length
-            ? serie6h.reduce((s, n) => s + n, 0) / serie6h.length
-            : null;
-
-          let rachaPrevia = 0;
-          for (const v of serie) {
-            if (v >= SPREAD_ALERT_PCT) rachaPrevia++;
-            else break;
-          }
+          const aNum = (v: any): number | null => {
+            const n = v === null || v === undefined ? NaN : Number(v);
+            return isNaN(n) ? null : n;
+          };
+          const serieGrande = (hist ?? []).map((h: any) => aNum(h.spread_pct));
+          const serieChico = (hist ?? []).map((h: any) => aNum(h.spread_pct_chico));
 
           const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
             best_buy_clp: topBuy[0]?.precio ?? b?.ask ?? null,
@@ -291,56 +381,39 @@ export default async () => {
           });
           if (eSnap) console.error("p2p_snapshots insert:", eSnap.message);
 
-          const sobreUmbral = makerPct >= SPREAD_ALERT_PCT;
-          const rachaActual = sobreUmbral ? rachaPrevia + 1 : 0;
-
-          // Linea extra para las alertas: segmento chico
-          const lineaChico =
-            makerPctCh !== null
-              ? `\n<i>Segmento chico ($${MONTO_CHICO.toLocaleString("es-CL")}): ${makerPctCh.toFixed(2)}% · $${medBuyCh.toLocaleString("es-CL")} / $${medSellCh.toLocaleString("es-CL")}</i>`
-              : "";
-
           resumen.push({
             par,
             fuente,
             grande: makerPct.toFixed(3),
+            netoGrande: netoMaker(makerPct).toFixed(3),
             chico: makerPctCh !== null ? makerPctCh.toFixed(3) : null,
-            racha: rachaActual,
+            netoChico: makerPctCh !== null ? netoMaker(makerPctCh).toFixed(3) : null,
           });
 
-          // --- ALERTA 1: cruce de umbral ---
-          const cruzoUmbral =
-            sobreUmbral && (previo === null || previo < SPREAD_ALERT_PCT);
-
-          if (cruzoUmbral) {
+          // --- ALERTAS MAKER por segmento (solo con datos directos de Binance) ---
+          if (fuente === "binance_depth" && topBuy.length && topSell.length) {
             alerts.push(
-              `🟢 <b>Margen maker: ${makerPct.toFixed(2)}%</b>\n` +
-                `Compra (mediana top ${TOP_N}): $${medBuy.toLocaleString("es-CL")}\n` +
-                `Venta (mediana top ${TOP_N}): $${medSell.toLocaleString("es-CL")}\n` +
-                `Umbral: ${SPREAD_ALERT_PCT}% · Fuente: ${fuente}` +
-                lineaChico
+              ...evaluarSegmento(
+                `montos grandes ($${fmt(MONTO_GRANDE)})`,
+                makerPct, serieGrande, topBuy, topSell, medBuy, medSell
+              )
+            );
+          }
+          if (makerPctCh !== null && topBuyChico.length && topSellChico.length) {
+            alerts.push(
+              ...evaluarSegmento(
+                `montos chicos ($${fmt(MONTO_CHICO)})`,
+                makerPctCh, serieChico, topBuyChico, topSellChico, medBuyCh, medSellCh
+              )
             );
           }
 
-          // --- ALERTA 3: recordatorio de ventana ---
+          // --- Expansion bruta (opcional, apagada por defecto) ---
+          const serie6h = serieGrande.slice(0, 36).filter((n): n is number => n !== null);
+          const promedio6h = serie6h.length ? serie6h.reduce((s, n) => s + n, 0) / serie6h.length : null;
+          const previo = serieGrande[0] ?? null;
           if (
-            !cruzoUmbral &&
-            sobreUmbral &&
-            rachaActual > 0 &&
-            rachaActual % RECORDATORIO_CADA === 0
-          ) {
-            const horas = ((rachaActual * 10) / 60).toFixed(1);
-            alerts.push(
-              `🔔 <b>Ventana sigue abierta — ${horas}h</b>\n` +
-                `Margen actual: <b>${makerPct.toFixed(2)}%</b>\n` +
-                `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}\n` +
-                `Lleva ${rachaActual} ciclos sobre ${SPREAD_ALERT_PCT}%` +
-                lineaChico
-            );
-          }
-
-          // --- ALERTA 2: expansion ---
-          if (
+            EXPANSION_ACTIVA &&
             promedio6h !== null &&
             serie6h.length >= EXPANSION_MIN_MUESTRAS &&
             makerPct >= EXPANSION_MIN_PCT
@@ -348,30 +421,25 @@ export default async () => {
             const gatillo = promedio6h * EXPANSION_FACTOR;
             const expandio = makerPct >= gatillo;
             const previoExpandio = previo !== null && previo >= gatillo;
-
-            if (expandio && !previoExpandio && !cruzoUmbral) {
-              const veces = (makerPct / promedio6h).toFixed(2);
+            if (expandio && !previoExpandio) {
               alerts.push(
-                `📈 <b>Expansión del spread</b>\n` +
-                  `Ahora: <b>${makerPct.toFixed(2)}%</b>\n` +
-                  `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie6h.length} muestras)\n` +
-                  `Está ${veces}× sobre lo normal\n` +
-                  `Compra $${medBuy.toLocaleString("es-CL")} / Venta $${medSell.toLocaleString("es-CL")}` +
-                  lineaChico
+                `📈 <b>Expansión del spread (bruto)</b>\n` +
+                  `Ahora: <b>${makerPct.toFixed(2)}%</b> · neto ${netoMaker(makerPct).toFixed(2)}%\n` +
+                  `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie6h.length} muestras)`
               );
             }
           }
 
           if (BUY_OPPORTUNITY_CLP > 0 && medBuy <= BUY_OPPORTUNITY_CLP) {
             alerts.push(
-              `🔵 <b>USDT barato: $${medBuy.toLocaleString("es-CL")}</b> (mediana)\n` +
-                `(tu objetivo: $${BUY_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
+              `🔵 <b>USDT barato: $${fmt(medBuy)}</b> (mediana)\n` +
+                `(tu objetivo: $${fmt(BUY_OPPORTUNITY_CLP)})`
             );
           }
           if (SELL_OPPORTUNITY_CLP > 0 && medSell >= SELL_OPPORTUNITY_CLP) {
             alerts.push(
-              `🟠 <b>Precio de venta alcanzado: $${medSell.toLocaleString("es-CL")}</b> (mediana)\n` +
-                `(tu objetivo: $${SELL_OPPORTUNITY_CLP.toLocaleString("es-CL")})`
+              `🟠 <b>Precio de venta alcanzado: $${fmt(medSell)}</b> (mediana)\n` +
+                `(tu objetivo: $${fmt(SELL_OPPORTUNITY_CLP)})`
             );
           }
         }
@@ -411,9 +479,9 @@ export default async () => {
           if (arbPct >= umbral && buyEx !== sellEx) {
             alerts.push(
               `⚡ <b>Arbitraje ${par}: ${arbPct.toFixed(2)}%</b>\n` +
-                `Comprar en <b>${buyEx}</b> a $${buyPrice.toLocaleString("es-CL")}\n` +
-                `Vender en <b>${sellEx}</b> a $${sellPrice.toLocaleString("es-CL")}\n` +
-                `Referencia: $${ref.toLocaleString("es-CL")}\n` +
+                `Comprar en <b>${buyEx}</b> a $${fmt(buyPrice)}\n` +
+                `Vender en <b>${sellEx}</b> a $${fmt(sellPrice)}\n` +
+                `Referencia: $${fmt(ref)}\n` +
                 `(bruto; falta descontar red y movimiento de precio)`
             );
           }
@@ -422,7 +490,11 @@ export default async () => {
     }
 
     for (const msg of alerts) {
-      await sendTelegram(`💱 <b>Monitor Cripto CLP</b>\n\n${msg}`);
+      try {
+        await sendTelegram(`💱 <b>Monitor Cripto CLP</b>\n\n${msg}`);
+      } catch (e: any) {
+        console.error("Telegram fallo:", e.message);
+      }
     }
 
     return new Response(
