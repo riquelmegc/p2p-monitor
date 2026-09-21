@@ -23,8 +23,12 @@ function clp(n) {
   return "$" + Math.round(Number(n)).toLocaleString("es-CL");
 }
 
+function fechaChile(d = new Date()) {
+  return new Date(d).toLocaleDateString("en-CA", { timeZone: "America/Santiago" });
+}
+
 function hoyChile() {
-  return new Date(Date.now() - 4 * 3600 * 1000).toISOString().slice(0, 10);
+  return fechaChile();
 }
 
 function normalizar(s) {
@@ -50,6 +54,44 @@ function parseUSDT(s) {
   return parseFloat((s || "").replace(",", "."));
 }
 
+async function tg(metodo, body) {
+  const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${metodo}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+// Foto normal (la más grande) o imagen enviada como archivo
+function extraerFoto(msg) {
+  if (msg.photo?.length) return msg.photo[msg.photo.length - 1];
+  if (msg.document?.mime_type?.startsWith("image/")) return msg.document;
+  return null;
+}
+
+// Guarda el file_id de Telegram y una copia en Supabase Storage (bucket "vouchers")
+async function guardarVoucher(supabase, ordenId, foto) {
+  let path = null;
+  try {
+    const info = await tg("getFile", { file_id: foto.file_id });
+    const fp = info?.result?.file_path;
+    if (fp) {
+      const bin = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fp}`).then((r) => r.arrayBuffer());
+      const ext = (fp.split(".").pop() || "jpg").toLowerCase();
+      path = `orden-${ordenId}/${Date.now()}.${ext}`;
+      const { error } = await supabase.storage.from("vouchers").upload(path, bin, { contentType: ext === "png" ? "image/png" : "image/jpeg" });
+      if (error) { console.error("Storage:", error.message); path = null; }
+    }
+  } catch (e) {
+    console.error("Voucher:", e.message);
+    path = null;
+  }
+  await supabase.from("vouchers").insert({ orden_id: ordenId, file_id: foto.file_id, storage_path: path });
+  const { count } = await supabase.from("vouchers").select("id", { count: "exact", head: true }).eq("orden_id", ordenId);
+  return { respaldada: !!path, total: count ?? 1 };
+}
+
 async function ordenes30d(supabase) {
   const desde = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
   const { count } = await supabase.from("ordenes_p2p").select("id", { count: "exact", head: true }).gte("created_at", desde);
@@ -73,6 +115,11 @@ const AYUDA =
   "  <code>/compra nick pesos usdt banco</code>\n" +
   "  <code>/venta nick pesos usdt banco</code>\n" +
   "  /ganancia — ganancia, stock y avance a 20\n\n" +
+  "<b>Vouchers (fotos):</b>\n" +
+  "  Foto con el /compra o /venta como texto → registra y guarda\n" +
+  "  Foto sin texto → se agrega a la última orden\n" +
+  "  Foto con <code>/foto 12</code> → se agrega a la orden #12\n" +
+  "  /fotos [n°] — ver fotos (última orden si no pones n°)\n\n" +
   "<b>Contrapartes P2P:</b>\n" +
   "  /check nickname\n" +
   "  /bloquear /ok /top /impuesto";
@@ -91,14 +138,52 @@ export default async (req) => {
   }
 
   const msg = update?.message;
-  if (!msg?.text) return new Response("ok");
+  if (!msg) return new Response("ok");
   if (String(msg.chat?.id) !== String(TELEGRAM_CHAT_ID)) return new Response("ok");
 
+  const foto = extraerFoto(msg);
+  const textoMsg = (msg.text ?? msg.caption ?? "").trim();
+  if (!textoMsg && !foto) return new Response("ok");
+
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-  const partes = msg.text.trim().split(/\s+/);
+  const partes = textoMsg ? textoMsg.split(/\s+/) : [""];
   const primera = partes[0].toLowerCase().split("@")[0];
 
   try {
+    // ── Foto sin /compra ni /venta: se adjunta a una orden existente ──
+    if (foto && primera !== "/compra" && primera !== "/venta") {
+      let orden;
+      if (primera === "/foto") {
+        const id = parseInt(partes[1], 10);
+        if (!id) { await reply("Uso: foto con texto <code>/foto 12</code>"); return new Response("ok"); }
+        const { data } = await supabase.from("ordenes_p2p").select("id,tipo,nickname").eq("id", id).limit(1);
+        orden = data?.[0];
+        if (!orden) { await reply(`No existe la orden #${id}.`); return new Response("ok"); }
+      } else {
+        const { data } = await supabase.from("ordenes_p2p").select("id,tipo,nickname").order("id", { ascending: false }).limit(1);
+        orden = data?.[0];
+        if (!orden) { await reply("Aún no hay órdenes para adjuntar la foto."); return new Response("ok"); }
+      }
+      const v = await guardarVoucher(supabase, orden.id, foto);
+      await reply(`📎 Voucher guardado en orden <b>#${orden.id}</b> (${orden.tipo} · ${orden.nickname})\nFotos en esta orden: ${v.total}` + (v.respaldada ? "" : "\n⚠️ No se pudo respaldar en Storage (quedó el enlace de Telegram)."));
+      return new Response("ok");
+    }
+
+    if (primera === "/fotos") {
+      let id = parseInt(partes[1], 10);
+      if (!id) {
+        const { data } = await supabase.from("ordenes_p2p").select("id").order("id", { ascending: false }).limit(1);
+        id = data?.[0]?.id;
+      }
+      if (!id) { await reply("Aún no hay órdenes."); return new Response("ok"); }
+      const { data: vs } = await supabase.from("vouchers").select("file_id").eq("orden_id", id).order("id");
+      if (!vs?.length) { await reply(`La orden #${id} no tiene fotos.`); return new Response("ok"); }
+      for (const [i, v] of vs.entries()) {
+        await tg("sendPhoto", { chat_id: TELEGRAM_CHAT_ID, photo: v.file_id, caption: `Orden #${id} · foto ${i + 1}/${vs.length}` });
+      }
+      return new Response("ok");
+    }
+
     if (primera === "/start" || primera === "/help" || primera === "/ayuda") {
       await reply(AYUDA);
       return new Response("ok");
@@ -136,8 +221,7 @@ export default async (req) => {
         await reply(`<b>Autopistas pagadas</b>\n\n${lineas.join("\n")}`);
         return new Response("ok");
       }
-      const hoy = new Date(Date.now() - 4 * 3600 * 1000);
-      hoy.setHours(0, 0, 0, 0);
+      const hoy = new Date(hoyChile() + "T00:00:00");
       let total = 0;
       const lineas = data.map((a) => {
         total += Number(a.monto_clp);
@@ -260,6 +344,8 @@ export default async (req) => {
         .single();
       if (error) throw new Error(error.message);
 
+      const voucher = foto ? await guardarVoucher(supabase, ins.id, foto) : null;
+
       let ganancia = null;
       if (tipo === "venta") {
         const { data: g } = await supabase.from("ganancias_p2p").select("ganancia_clp").eq("id", ins.id).single();
@@ -292,10 +378,11 @@ export default async (req) => {
       }
 
       const n = await ordenes30d(supabase);
-      let texto = `${tipo === "compra" ? "🟦 <b>Compra</b>" : "🟧 <b>Venta</b>"} registrada — ${nick}${c ? "" : " (nueva)"}\n` +
+      let texto = `${tipo === "compra" ? "🟦 <b>Compra</b>" : "🟧 <b>Venta</b>"} registrada <b>#${ins.id}</b> — ${nick}${c ? "" : " (nueva)"}\n` +
         `${clp(monto)} · ${usdt.toFixed(2)} USDT\nPrecio efectivo: ${Number(ins.precio_efectivo).toLocaleString("es-CL")}` +
         (banco ? `\nBanco: ${banco}` : "");
       if (ganancia !== null) texto += `\n\n${ganancia >= 0 ? "🟢" : "🔴"} Ganancia: <b>${clp(ganancia)}</b>\n💰 Apartado impuesto: ${clp(Math.max(0, ganancia * IMPUESTO_P2P))}`;
+      if (voucher) texto += `\n📎 Voucher guardado`;
       texto += `\n\nOperaciones con ${nick}: ${ops} · límite: ${clp(limiteSugerido(ops))}`;
       texto += `\n📈 Órdenes 30 días: <b>${n} de ${META_MAKER}</b>` + (n >= META_MAKER ? " ✅ ¡Meta maker!" : "");
       await reply(texto + aviso);
@@ -310,7 +397,7 @@ export default async (req) => {
       const total = ventas.reduce((s, o) => s + Number(o.ganancia_clp || 0), 0);
       const hoy = hoyChile();
       const hoyGan = ventas
-        .filter((o) => new Date(new Date(o.created_at).getTime() - 4 * 3600 * 1000).toISOString().slice(0, 10) === hoy)
+        .filter((o) => fechaChile(o.created_at) === hoy)
         .reduce((s, o) => s + Number(o.ganancia_clp || 0), 0);
       const ult = lista[lista.length - 1];
       const n = await ordenes30d(supabase);
