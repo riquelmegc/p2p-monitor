@@ -10,6 +10,7 @@ const RETENCION_UBER = 0.1525;
 const IMPUESTO_P2P = 0.20;
 const LIMITE_NUEVO = 200000;
 const META_MAKER = 20;
+const STOCK_INICIAL = "stock_inicial"; // saldo previo cargado a mano: no cuenta como orden
 
 async function reply(text) {
   await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -94,7 +95,7 @@ async function guardarVoucher(supabase, ordenId, foto) {
 
 async function ordenes30d(supabase) {
   const desde = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
-  const { count } = await supabase.from("ordenes_p2p").select("id", { count: "exact", head: true }).gte("created_at", desde);
+  const { count } = await supabase.from("ordenes_p2p").select("id", { count: "exact", head: true }).neq("nickname", STOCK_INICIAL).gte("created_at", desde);
   return count ?? 0;
 }
 
@@ -160,7 +161,7 @@ export default async (req) => {
         orden = data?.[0];
         if (!orden) { await reply(`No existe la orden #${id}.`); return new Response("ok"); }
       } else {
-        const { data } = await supabase.from("ordenes_p2p").select("id,tipo,nickname").order("id", { ascending: false }).limit(1);
+        const { data } = await supabase.from("ordenes_p2p").select("id,tipo,nickname").neq("nickname", STOCK_INICIAL).order("id", { ascending: false }).limit(1);
         orden = data?.[0];
         if (!orden) { await reply("Aún no hay órdenes para adjuntar la foto."); return new Response("ok"); }
       }
@@ -172,7 +173,7 @@ export default async (req) => {
     if (primera === "/fotos") {
       let id = parseInt(partes[1], 10);
       if (!id) {
-        const { data } = await supabase.from("ordenes_p2p").select("id").order("id", { ascending: false }).limit(1);
+        const { data } = await supabase.from("ordenes_p2p").select("id").neq("nickname", STOCK_INICIAL).order("id", { ascending: false }).limit(1);
         id = data?.[0]?.id;
       }
       if (!id) { await reply("Aún no hay órdenes."); return new Response("ok"); }
