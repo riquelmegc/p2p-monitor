@@ -118,6 +118,10 @@ const AYUDA =
   "  /ganancia — ganancia, stock y avance a 20\n" +
   "  /capital — saldo en USDT y en pesos\n" +
   "  <code>/capital ajustar 9500000</code> — corrige los pesos (depósitos/retiros)\n\n" +
+  "<b>Vigilar tus precios de anuncio:</b>\n" +
+  "  <code>/precios 956.20 949.00</code> — venta y compra (activa avisos)\n" +
+  "  <code>/precios venta 955.89</code> o <code>/precios compra 949.10</code>\n" +
+  "  /precios — ver · <code>/precios off</code> — apagar avisos\n\n" +
   "<b>Vouchers (fotos):</b>\n" +
   "  Foto con el /compra o /venta como texto → registra y guarda\n" +
   "  Foto sin texto → se agrega a la última orden\n" +
@@ -389,6 +393,64 @@ export default async (req) => {
       texto += `\n\nOperaciones con ${nick}: ${ops} · límite: ${clp(limiteSugerido(ops))}`;
       texto += `\n📈 Órdenes 30 días: <b>${n} de ${META_MAKER}</b>` + (n >= META_MAKER ? " ✅ ¡Meta maker!" : "");
       await reply(texto + aviso);
+      return new Response("ok");
+    }
+
+    if (primera === "/precios") {
+      const { data: cfg } = await supabase.from("config_p2p").select("clave,valor");
+      const val = (k) => Number(cfg?.find((c) => c.clave === k)?.valor ?? 0);
+      const ahora = new Date().toISOString();
+      const guardar = (filas) => supabase.from("config_p2p").upsert(filas.map((f) => ({ ...f, updated_at: ahora })));
+      const sub = (partes[1] || "").toLowerCase();
+      const mostrar = async (titulo) => {
+        const { data: c2 } = await supabase.from("config_p2p").select("clave,valor");
+        const v2 = (k) => Number(c2?.find((c) => c.clave === k)?.valor ?? 0);
+        const venta = v2("mi_precio_venta"), compra = v2("mi_precio_compra");
+        const dif = venta && compra ? venta - compra : 0;
+        await reply(
+          `${titulo}\n\n` +
+          `Venta: <b>${venta ? "$" + venta.toLocaleString("es-CL") : "—"}</b>\n` +
+          `Compra: <b>${compra ? "$" + compra.toLocaleString("es-CL") : "—"}</b>\n` +
+          (dif ? `Diferencia: ${dif.toFixed(2)} pesos ${dif >= 7 ? "✅" : dif >= 4 ? "⚠️" : "❌"}\n` : "") +
+          `Avisos: ${v2("mis_precios_activo") === 1 ? "🟢 activos" : "⚪ apagados"}`
+        );
+      };
+
+      if (!sub) { await mostrar("🎯 <b>Tus precios</b>"); return new Response("ok"); }
+
+      if (sub === "off") {
+        await guardar([{ clave: "mis_precios_activo", valor: 0 }]);
+        await reply("⚪ Avisos de precio <b>apagados</b>.");
+        return new Response("ok");
+      }
+
+      if (sub === "venta" || sub === "compra") {
+        const precio = parseFloat((partes[2] || "").replace(",", "."));
+        if (!(precio > 0)) { await reply(`Uso: <code>/precios ${sub} 955.89</code>`); return new Response("ok"); }
+        await guardar([
+          { clave: sub === "venta" ? "mi_precio_venta" : "mi_precio_compra", valor: precio },
+          { clave: sub === "venta" ? "aviso_venta_ref" : "aviso_compra_ref", valor: 0 },
+          { clave: "mis_precios_activo", valor: 1 },
+        ]);
+        await mostrar(`✅ Precio de <b>${sub}</b> actualizado`);
+        return new Response("ok");
+      }
+
+      const venta = parseFloat((partes[1] || "").replace(",", "."));
+      const compra = parseFloat((partes[2] || "").replace(",", "."));
+      if (!(venta > 0) || !(compra > 0)) {
+        await reply("Uso: <code>/precios 956.20 949.00</code> (venta y compra)\n<code>/precios venta 955.89</code> · <code>/precios off</code>");
+        return new Response("ok");
+      }
+      if (venta <= compra) { await reply("⚠️ Tu venta debe ser mayor que tu compra. Revisa el orden: primero venta, después compra."); return new Response("ok"); }
+      await guardar([
+        { clave: "mi_precio_venta", valor: venta },
+        { clave: "mi_precio_compra", valor: compra },
+        { clave: "aviso_venta_ref", valor: 0 },
+        { clave: "aviso_compra_ref", valor: 0 },
+        { clave: "mis_precios_activo", valor: 1 },
+      ]);
+      await mostrar("🎯 <b>Precios registrados — avisos activos</b>\nTe aviso si alguien te gana. Se apagan solos cuando cierre la ventana.");
       return new Response("ok");
     }
 
