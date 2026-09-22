@@ -184,8 +184,9 @@ function evaluarSegmento(
   topS: any[],
   medB: number,
   medS: number
-): string[] {
+): { msgs: string[]; cerro: boolean } {
   const out: string[] = [];
+  let cerro = false;
   const neto = netoMaker(spreadPct);
   const abierta = neto >= MAKER_NET_MIN_PCT;
 
@@ -211,7 +212,7 @@ function evaluarSegmento(
     `Precios para tus anuncios:\n` +
     (netComp >= MAKER_NET_MIN_PCT
       ? `• <b>Primer lugar</b>: venta $${fmt(ventaComp)} / compra $${fmt(compraComp)} → neto ${netComp.toFixed(2)}%\n`
-      : `• Primer lugar: venta $${fmt(ventaComp)} / compra $${fmt(compraComp)} → neto ${netComp.toFixed(2)}% ❌ no rinde\n`) +
+      : `• Primer lugar: venta $${fmt(ventaComp)} / compra $${fmt(compraComp)} → neto ${netComp.toFixed(2)}% ⚠️ bajo el mínimo\n`) +
     `• <b>Precio medio</b> (se llena más lento): venta $${fmt(ventaMed)} / compra $${fmt(compraMed)} → neto ${netMed.toFixed(2)}%`;
 
   const cabecera =
@@ -232,6 +233,7 @@ function evaluarSegmento(
         `Revisa que tus precios sigan competitivos.`
     );
   } else if (!abierta && previaAbierta) {
+    cerro = true;
     out.push(
       `🔴 <b>Ventana maker CERRADA — ${etiqueta}</b>\n` +
         `${cabecera}\n\n` +
@@ -239,6 +241,78 @@ function evaluarSegmento(
     );
   }
 
+  return { msgs: out, cerro };
+}
+
+// ============================================================
+// Vigilancia de TUS precios (los registras con /precios en el bot)
+//   topB[0]: el anuncio de venta mas barato del mercado (compite con tu VENTA)
+//   topS[0]: el anuncio de compra que mas paga (compite con tu COMPRA)
+// Avisa una sola vez por cada precio nuevo del competidor.
+// ============================================================
+async function vigilarMisPrecios(supabase: any, topB: any[], topS: any[]): Promise<string[]> {
+  const { data: cfg } = await supabase.from("config_p2p").select("clave,valor");
+  const val = (k: string) => Number(cfg?.find((c: any) => c.clave === k)?.valor ?? 0);
+  if (val("mis_precios_activo") !== 1) return [];
+
+  const miVenta = val("mi_precio_venta");
+  const miCompra = val("mi_precio_compra");
+  const refVenta = val("aviso_venta_ref");
+  const refCompra = val("aviso_compra_ref");
+  const out: string[] = [];
+  const cambios: { clave: string; valor: number }[] = [];
+
+  const veredicto = (dif: number, base: number) => {
+    const neto = netoMaker((dif / base) * 100);
+    if (neto >= MAKER_NET_MIN_PCT) return `✅ Ajusta: sigues con buen margen (neto ${neto.toFixed(2)}%)`;
+    if (neto > 0) return `⚠️ Casi sin ganancia (neto ${neto.toFixed(2)}%): ajusta solo si quieres sumar órdenes`;
+    return `❌ No lo sigas: perderías plata (neto ${neto.toFixed(2)}%). Quédate en tu precio o apaga`;
+  };
+
+  // --- Tu VENTA ---
+  const rivalV = topB[0];
+  if (miVenta > 0 && rivalV && rivalV.precio < miVenta - 0.001) {
+    if (Math.abs(rivalV.precio - refVenta) > 0.001) {
+      const nuevo = r2(rivalV.precio - 0.01);
+      const dif = nuevo - miCompra;
+      out.push(
+        `⚠️ <b>Te ganaron en VENTA</b>\n` +
+          `Tu precio: $${fmt(miVenta)} · ${rivalV.nick}: $${fmt(rivalV.precio)}\n` +
+          `Para quedar primero: <b>$${fmt(nuevo)}</b>\n` +
+          `Diferencia con tu compra ($${fmt(miCompra)}): ${dif.toFixed(2)} pesos\n` +
+          `${veredicto(dif, miCompra)}\n` +
+          `Si ajustas, avísale al bot: <code>/precios venta ${nuevo}</code>`
+      );
+      cambios.push({ clave: "aviso_venta_ref", valor: rivalV.precio });
+    }
+  } else if (refVenta !== 0) {
+    cambios.push({ clave: "aviso_venta_ref", valor: 0 });
+  }
+
+  // --- Tu COMPRA ---
+  const rivalC = topS[0];
+  if (miCompra > 0 && rivalC && rivalC.precio > miCompra + 0.001) {
+    if (Math.abs(rivalC.precio - refCompra) > 0.001) {
+      const nuevo = r2(rivalC.precio + 0.01);
+      const dif = miVenta - nuevo;
+      out.push(
+        `⚠️ <b>Te ganaron en COMPRA</b>\n` +
+          `Tu precio: $${fmt(miCompra)} · ${rivalC.nick}: $${fmt(rivalC.precio)}\n` +
+          `Para quedar primero: <b>$${fmt(nuevo)}</b>\n` +
+          `Diferencia con tu venta ($${fmt(miVenta)}): ${dif.toFixed(2)} pesos\n` +
+          `${veredicto(dif, nuevo)}\n` +
+          `Si ajustas, avísale al bot: <code>/precios compra ${nuevo}</code>`
+      );
+      cambios.push({ clave: "aviso_compra_ref", valor: rivalC.precio });
+    }
+  } else if (refCompra !== 0) {
+    cambios.push({ clave: "aviso_compra_ref", valor: 0 });
+  }
+
+  if (cambios.length) {
+    const ahora = new Date().toISOString();
+    await supabase.from("config_p2p").upsert(cambios.map((c) => ({ ...c, updated_at: ahora })));
+  }
   return out;
 }
 
@@ -396,16 +470,28 @@ export default async () => {
               ...evaluarSegmento(
                 `montos grandes ($${fmt(MONTO_GRANDE)})`,
                 makerPct, serieGrande, topBuy, topSell, medBuy, medSell
-              )
+              ).msgs
             );
           }
           if (makerPctCh !== null && topBuyChico.length && topSellChico.length) {
-            alerts.push(
-              ...evaluarSegmento(
-                `montos chicos ($${fmt(MONTO_CHICO)})`,
-                makerPctCh, serieChico, topBuyChico, topSellChico, medBuyCh, medSellCh
-              )
+            const ch = evaluarSegmento(
+              `montos chicos ($${fmt(MONTO_CHICO)})`,
+              makerPctCh, serieChico, topBuyChico, topSellChico, medBuyCh, medSellCh
             );
+            alerts.push(...ch.msgs);
+
+            if (ch.cerro) {
+              // Ventana chica cerrada: se apaga la vigilancia de tus precios
+              await supabase.from("config_p2p").upsert([
+                { clave: "mis_precios_activo", valor: 0, updated_at: new Date().toISOString() },
+              ]);
+            } else {
+              try {
+                alerts.push(...(await vigilarMisPrecios(supabase, topBuyChico, topSellChico)));
+              } catch (e: any) {
+                console.error("Vigilancia de precios fallo:", e.message);
+              }
+            }
           }
 
           // --- Expansion bruta (opcional, apagada por defecto) ---
