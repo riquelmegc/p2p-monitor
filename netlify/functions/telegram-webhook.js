@@ -93,6 +93,109 @@ async function guardarVoucher(supabase, ordenId, foto) {
   return { respaldada: !!path, total: count ?? 1 };
 }
 
+// Rango razonable de precio efectivo USDT/CLP (protege contra errores de tipeo)
+const PRECIO_MIN = 800;
+const PRECIO_MAX = 1100;
+
+// Nombres de banco unificados
+const ALIAS_BANCO = {
+  bancochile: "bancodechile", chile: "bancodechile", bchile: "bancodechile", bancodechile: "bancodechile",
+  estado: "bancoestado", bancoestado: "bancoestado", cuentarut: "bancoestado",
+  falabella: "falabella", bancofalabella: "falabella",
+  santander: "santander", bancosantander: "santander",
+  mercadopago: "mercadopago", mp: "mercadopago",
+  tenpo: "tenpo", mach: "mach", bci: "bci", scotiabank: "scotiabank", itau: "itau", global66: "global66",
+};
+function normalizarBanco(txt) {
+  if (!txt) return null;
+  const k = txt.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]/g, "");
+  return ALIAS_BANCO[k] ?? k;
+}
+
+// Revisa que los datos de una orden tengan sentido. Devuelve un texto de error o null.
+function validarOrden(monto, usdt, bancoTxt) {
+  const precio = monto / usdt;
+  if (precio < PRECIO_MIN || precio > PRECIO_MAX) {
+    return `⚠️ <b>No guardé la orden</b>: el precio sale <b>${precio.toLocaleString("es-CL", { maximumFractionDigits: 2 })}</b> por USDT, fuera de lo normal (${PRECIO_MIN}–${PRECIO_MAX}).\n\n` +
+      `Revisa los números. Escribe los pesos <b>sin espacios</b>: <code>43200</code> o <code>43.200</code>, no <code>43 200</code>.`;
+  }
+  if (bancoTxt && /\d/.test(bancoTxt)) {
+    return `⚠️ <b>No guardé la orden</b>: el banco "<b>${bancoTxt}</b>" tiene números. Probablemente escribiste un monto con espacio.\n\n` +
+      `Formato: <code>/venta nick pesos usdt banco</code>`;
+  }
+  return null;
+}
+
+// ── Diferencial compra/venta de un periodo (precios efectivos, comisiones incluidas) ──
+async function diferencial(supabase, fechas, titulo) {
+  const desde = new Date(Date.now() - 40 * 24 * 3600 * 1000).toISOString();
+  const { data } = await supabase.from("ordenes_p2p")
+    .select("tipo,monto_clp,usdt,created_at")
+    .neq("nickname", STOCK_INICIAL)
+    .gte("created_at", desde);
+  const lista = (data ?? []).filter((o) => fechas.includes(fechaChile(o.created_at)));
+  const n2 = (x) => Number(x).toLocaleString("es-CL", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const suma = (tipo) => {
+    const f = lista.filter((o) => o.tipo === tipo);
+    const usdt = f.reduce((s, o) => s + Number(o.usdt), 0);
+    const pesos = f.reduce((s, o) => s + Number(o.monto_clp), 0);
+    return { n: f.length, usdt, pesos, prom: usdt > 0 ? pesos / usdt : 0 };
+  };
+  const V = suma("venta");
+  const C = suma("compra");
+
+  if (!V.n && !C.n) return `📊 <b>Diferencial — ${titulo}</b>\n\nSin órdenes en este periodo.`;
+
+  let t = `📊 <b>Diferencial — ${titulo}</b>\n\n` +
+    `🟧 Ventas: ${V.n} · ${n2(V.usdt)} USDT · ${clp(V.pesos)}` + (V.n ? ` · prom <b>${n2(V.prom)}</b>` : "") + `\n` +
+    `🟦 Compras: ${C.n} · ${n2(C.usdt)} USDT · ${clp(C.pesos)}` + (C.n ? ` · prom <b>${n2(C.prom)}</b>` : "") + `\n` +
+    `━━━━━━━━\n`;
+
+  if (V.n && C.n) {
+    const dif = V.prom - C.prom;
+    const cerrado = Math.min(V.usdt, C.usdt);
+    const gan = cerrado * dif;
+    t += `Diferencial: <b>${n2(dif)} pesos/USDT</b> (${((dif / C.prom) * 100).toFixed(2)}%)\n` +
+      `${gan >= 0 ? "✅" : "🔴"} Ganancia cerrada: <b>${clp(gan)}</b> (sobre ${n2(cerrado)} USDT)\n`;
+  } else {
+    t += `Aún no hay ${V.n ? "compras" : "ventas"}: la ganancia se define cuando cierres el otro lado.\n`;
+  }
+
+  // Lado abierto + estimación con el mercado actual (lectura más reciente del monitor)
+  const abierto = V.usdt - C.usdt;
+  if (Math.abs(abierto) >= 0.01) {
+    const { data: snap } = await supabase.from("p2p_snapshots")
+      .select("buy_top_chico,sell_top_chico").order("created_at", { ascending: false }).limit(1);
+    const s0 = snap?.[0];
+    if (abierto > 0) {
+      t += `\n⏳ <b>Por recomprar: ${n2(abierto)} USDT</b>\nPara ganar, recompra bajo <b>${n2(V.prom)}</b> (efectivo)`;
+      const mejorCompra = Number(s0?.sell_top_chico?.[0]?.precio ?? 0);
+      if (mejorCompra > 0) {
+        const efectivo = (mejorCompra + 0.01) * 1.002;
+        t += `\nCon tu anuncio 1.º hoy (~${n2(mejorCompra + 0.01)}): ≈ <b>${clp((V.prom - efectivo) * abierto)}</b> más`;
+      }
+    } else {
+      const falta = -abierto;
+      t += `\n⏳ <b>Por vender: ${n2(falta)} USDT</b>\nPara ganar, vende sobre <b>${n2(C.prom)}</b> (efectivo)`;
+      const mejorVenta = Number(s0?.buy_top_chico?.[0]?.precio ?? 0);
+      if (mejorVenta > 0) {
+        const efectivo = (mejorVenta - 0.01) * 0.998;
+        t += `\nCon tu anuncio 1.º hoy (~${n2(mejorVenta - 0.01)}): ≈ <b>${clp((efectivo - C.prom) * falta)}</b> más`;
+      }
+    }
+  } else if (V.n && C.n) {
+    t += `\n⚖️ Ciclo cerrado: vendiste y recompraste lo mismo.`;
+  }
+  return t;
+}
+
+function diasAtras(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(fechaChile(new Date(Date.now() - i * 24 * 3600 * 1000)));
+  return out;
+}
+
 async function ordenes30d(supabase) {
   const desde = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
   const { count } = await supabase.from("ordenes_p2p").select("id", { count: "exact", head: true }).neq("nickname", STOCK_INICIAL).gte("created_at", desde);
@@ -116,12 +219,17 @@ const AYUDA =
   "  <code>/compra nick pesos usdt banco</code>\n" +
   "  <code>/venta nick pesos usdt banco</code>\n" +
   "  /ganancia — ganancia, stock y avance a 20\n" +
+  "  /dia — diferencial compra/venta de hoy (<code>/dia ayer</code>)\n" +
+  "  /semana · /mes — diferencial del periodo\n" +
+  "  <code>/editar 43200 45.16 bancodechile</code> — corrige la última orden\n" +
+  "  <code>/editar 14 43200 45.16 bancodechile</code> — corrige la orden #14\n" +
   "  /capital — saldo en USDT y en pesos\n" +
   "  <code>/capital ajustar 9500000</code> — corrige los pesos (depósitos/retiros)\n\n" +
   "<b>Vigilar tus precios de anuncio:</b>\n" +
   "  <code>/precios 956.20 949.00</code> — venta y compra (activa avisos)\n" +
   "  <code>/precios venta 955.89</code> o <code>/precios compra 949.10</code>\n" +
-  "  /precios — ver · <code>/precios off</code> — apagar avisos\n\n" +
+  "  <code>/precios venta off</code> — apaga solo avisos de venta (on para encender)\n" +
+  "  /precios — ver · <code>/precios off</code> — apagar todos los avisos\n\n" +
   "<b>Vouchers (fotos):</b>\n" +
   "  Foto con el /compra o /venta como texto → registra y guarda\n" +
   "  Foto sin texto → se agrega a la última orden\n" +
@@ -129,7 +237,8 @@ const AYUDA =
   "  /fotos [n°] — ver fotos (última orden si no pones n°)\n\n" +
   "<b>Contrapartes P2P:</b>\n" +
   "  /check nickname\n" +
-  "  /bloquear /ok /top /impuesto";
+  "  /bloquear /ok /top\n" +
+  "  /impuesto — cuánto apartar: hoy, semana, mes y total";
 
 export default async (req) => {
   const secret = req.headers.get("x-telegram-bot-api-secret-token");
@@ -338,11 +447,14 @@ export default async (req) => {
       const nick = (partes[1] || "").toLowerCase();
       const monto = parseCLP(partes[2]);
       const usdt = parseUSDT(partes[3]);
-      const banco = partes.slice(4).join(" ").toLowerCase() || null;
+      const bancoTxt = partes.slice(4).join(" ") || null;
       if (!nick || !(monto > 0) || !(usdt > 0)) {
         await reply(`Uso: <code>${primera} nick pesos usdt banco</code>\nEj: <code>${primera} finansmart 50000 51.93 mercadopago</code>`);
         return new Response("ok");
       }
+      const errorValidacion = validarOrden(monto, usdt, bancoTxt);
+      if (errorValidacion) { await reply(errorValidacion); return new Response("ok"); }
+      const banco = normalizarBanco(bancoTxt);
 
       const { data: ins, error } = await supabase
         .from("ordenes_p2p")
@@ -358,7 +470,7 @@ export default async (req) => {
         const { data: g } = await supabase.from("ganancias_p2p").select("ganancia_clp").eq("id", ins.id).single();
         ganancia = Math.round(Number(g?.ganancia_clp ?? 0));
         await supabase.from("impuesto_apartado").insert({
-          fecha: hoyChile(), nickname: nick, monto_operado_clp: monto,
+          orden_id: ins.id, fecha: hoyChile(), nickname: nick, monto_operado_clp: monto,
           ganancia_clp: ganancia, impuesto_clp: Math.round(ganancia * IMPUESTO_P2P),
         });
       }
@@ -406,11 +518,12 @@ export default async (req) => {
         const { data: c2 } = await supabase.from("config_p2p").select("clave,valor");
         const v2 = (k) => Number(c2?.find((c) => c.clave === k)?.valor ?? 0);
         const venta = v2("mi_precio_venta"), compra = v2("mi_precio_compra");
+        const lado = (k) => { const f = c2?.find((c) => c.clave === k); return f ? Number(f.valor) === 1 : true; };
         const dif = venta && compra ? venta - compra : 0;
         await reply(
           `${titulo}\n\n` +
-          `Venta: <b>${venta ? "$" + venta.toLocaleString("es-CL") : "—"}</b>\n` +
-          `Compra: <b>${compra ? "$" + compra.toLocaleString("es-CL") : "—"}</b>\n` +
+          `Venta: <b>${venta ? "$" + venta.toLocaleString("es-CL") : "—"}</b> ${lado("mis_avisos_venta") ? "🔔" : "🔕"}\n` +
+          `Compra: <b>${compra ? "$" + compra.toLocaleString("es-CL") : "—"}</b> ${lado("mis_avisos_compra") ? "🔔" : "🔕"}\n` +
           (dif ? `Diferencia: ${dif.toFixed(2)} pesos ${dif >= 7 ? "✅" : dif >= 4 ? "⚠️" : "❌"}\n` : "") +
           `Avisos: ${v2("mis_precios_activo") === 1 ? "🟢 activos" : "⚪ apagados"}`
         );
@@ -424,12 +537,22 @@ export default async (req) => {
         return new Response("ok");
       }
 
+      if ((sub === "venta" || sub === "compra") && ["off", "on"].includes((partes[2] || "").toLowerCase())) {
+        const on = partes[2].toLowerCase() === "on";
+        const filas = [{ clave: sub === "venta" ? "mis_avisos_venta" : "mis_avisos_compra", valor: on ? 1 : 0 }];
+        if (on) filas.push({ clave: "mis_precios_activo", valor: 1 }, { clave: sub === "venta" ? "aviso_venta_ref" : "aviso_compra_ref", valor: 0 });
+        await guardar(filas);
+        await mostrar(on ? `🔔 Avisos de <b>${sub}</b> encendidos` : `🔕 Avisos de <b>${sub}</b> apagados (el otro lado sigue igual)`);
+        return new Response("ok");
+      }
+
       if (sub === "venta" || sub === "compra") {
         const precio = parseFloat((partes[2] || "").replace(",", "."));
         if (!(precio > 0)) { await reply(`Uso: <code>/precios ${sub} 955.89</code>`); return new Response("ok"); }
         await guardar([
           { clave: sub === "venta" ? "mi_precio_venta" : "mi_precio_compra", valor: precio },
           { clave: sub === "venta" ? "aviso_venta_ref" : "aviso_compra_ref", valor: 0 },
+          { clave: sub === "venta" ? "mis_avisos_venta" : "mis_avisos_compra", valor: 1 },
           { clave: "mis_precios_activo", valor: 1 },
         ]);
         await mostrar(`✅ Precio de <b>${sub}</b> actualizado`);
@@ -448,6 +571,8 @@ export default async (req) => {
         { clave: "mi_precio_compra", valor: compra },
         { clave: "aviso_venta_ref", valor: 0 },
         { clave: "aviso_compra_ref", valor: 0 },
+        { clave: "mis_avisos_venta", valor: 1 },
+        { clave: "mis_avisos_compra", valor: 1 },
         { clave: "mis_precios_activo", valor: 1 },
       ]);
       await mostrar("🎯 <b>Precios registrados — avisos activos</b>\nTe aviso si alguien te gana. Se apagan solos cuando cierre la ventana.");
@@ -484,6 +609,95 @@ export default async (req) => {
         `Pesos: <b>${clp(pesos)}</b>\n\n` +
         `━━━━━━━━\n<b>TOTAL a costo: ${clp(valorUsdt + pesos)}</b>`
       );
+      return new Response("ok");
+    }
+
+    // ── /editar: corrige una orden (la última, o una por número) ──
+    //   /editar pesos usdt [banco]         → última orden
+    //   /editar 14 pesos usdt [banco]      → orden #14
+    if (primera === "/editar") {
+      let args = partes.slice(1);
+      let orden;
+      const usoEditar = "Uso:\n<code>/editar pesos usdt banco</code> → corrige la última orden\n<code>/editar 14 pesos usdt banco</code> → corrige la orden #14";
+      if (args[0] && args[0].startsWith("#")) args[0] = args[0].slice(1);
+
+      if (args.length >= 3 && /^\d+$/.test(args[0]) && Number(args[0]) < 100000 && parseUSDT(args[2]) > 0 && parseCLP(args[1]) >= 1000) {
+        const { data } = await supabase.from("ordenes_p2p").select("*").eq("id", Number(args[0])).limit(1);
+        orden = data?.[0];
+        args = args.slice(1);
+        if (!orden) { await reply(`No existe la orden #${partes[1]}.`); return new Response("ok"); }
+      } else {
+        const { data } = await supabase.from("ordenes_p2p").select("*").neq("nickname", STOCK_INICIAL).order("id", { ascending: false }).limit(1);
+        orden = data?.[0];
+      }
+      if (!orden) { await reply("No hay órdenes para editar."); return new Response("ok"); }
+      if (orden.nickname === STOCK_INICIAL) { await reply("El stock inicial no se edita desde aquí."); return new Response("ok"); }
+
+      const monto = parseCLP(args[0]);
+      const usdt = parseUSDT(args[1]);
+      const bancoTxt = args.slice(2).join(" ") || null;
+      if (!(monto > 0) || !(usdt > 0)) { await reply(usoEditar); return new Response("ok"); }
+      const errorValidacion = validarOrden(monto, usdt, bancoTxt);
+      if (errorValidacion) { await reply(errorValidacion.replace("No guardé la orden", "No edité la orden")); return new Response("ok"); }
+      const banco = bancoTxt ? normalizarBanco(bancoTxt) : orden.banco;
+
+      const antes = { monto: Number(orden.monto_clp), usdt: Number(orden.usdt), banco: orden.banco };
+      let gananciaAntes = 0;
+      if (orden.tipo === "venta") {
+        const { data: g0 } = await supabase.from("ganancias_p2p").select("ganancia_clp").eq("id", orden.id).single();
+        gananciaAntes = Math.round(Number(g0?.ganancia_clp ?? 0));
+      }
+
+      const { error: eUpd } = await supabase.from("ordenes_p2p").update({ monto_clp: monto, usdt, banco }).eq("id", orden.id);
+      if (eUpd) throw new Error(eUpd.message);
+
+      let gananciaNueva = 0;
+      if (orden.tipo === "venta") {
+        const { data: g1 } = await supabase.from("ganancias_p2p").select("ganancia_clp").eq("id", orden.id).single();
+        gananciaNueva = Math.round(Number(g1?.ganancia_clp ?? 0));
+        const filaImp = { monto_operado_clp: monto, ganancia_clp: gananciaNueva, impuesto_clp: Math.round(gananciaNueva * IMPUESTO_P2P) };
+        const { data: imp } = await supabase.from("impuesto_apartado").select("id").eq("orden_id", orden.id).limit(1);
+        if (imp?.[0]) {
+          await supabase.from("impuesto_apartado").update(filaImp).eq("id", imp[0].id);
+        } else {
+          const { data: imp2 } = await supabase.from("impuesto_apartado").select("id").ilike("nickname", orden.nickname).eq("monto_operado_clp", antes.monto).order("id", { ascending: false }).limit(1);
+          if (imp2?.[0]) await supabase.from("impuesto_apartado").update({ ...filaImp, orden_id: orden.id }).eq("id", imp2[0].id);
+        }
+      }
+
+      const { data: cRows } = await supabase.from("contrapartes").select("*").ilike("nickname", orden.nickname).limit(1);
+      const c = cRows?.[0];
+      if (c) {
+        await supabase.from("contrapartes").update({
+          monto_acumulado_clp: Number(c.monto_acumulado_clp) - antes.monto + monto,
+          ganancia_acumulada_clp: Number(c.ganancia_acumulada_clp || 0) - gananciaAntes + gananciaNueva,
+          banco: banco ?? c.banco,
+        }).eq("id", c.id);
+      }
+
+      await reply(
+        `✏️ <b>Orden #${orden.id} corregida</b> (${orden.tipo} · ${orden.nickname})\n\n` +
+        `Antes: ${clp(antes.monto)} · ${antes.usdt} USDT · ${antes.banco ?? "—"}\n` +
+        `Ahora: <b>${clp(monto)} · ${usdt} USDT · ${banco ?? "—"}</b>\n` +
+        `Precio efectivo: ${(monto / usdt).toLocaleString("es-CL", { maximumFractionDigits: 2 })}` +
+        (orden.tipo === "venta" ? `\nGanancia: ${clp(gananciaAntes)} → <b>${clp(gananciaNueva)}</b>` : "")
+      );
+      return new Response("ok");
+    }
+
+    if (primera === "/dia" || primera === "/semana" || primera === "/mes") {
+      let fechas, titulo;
+      if (primera === "/semana") {
+        fechas = diasAtras(7); titulo = "últimos 7 días";
+      } else if (primera === "/mes") {
+        const mesActual = hoyChile().slice(0, 7);
+        fechas = diasAtras(31).filter((f) => f.startsWith(mesActual)); titulo = "este mes";
+      } else if ((partes[1] || "").toLowerCase() === "ayer") {
+        fechas = [diasAtras(2)[1]]; titulo = `ayer (${fechas[0].slice(8, 10)}-${fechas[0].slice(5, 7)})`;
+      } else {
+        fechas = [hoyChile()]; titulo = `hoy (${fechas[0].slice(8, 10)}-${fechas[0].slice(5, 7)})`;
+      }
+      await reply(await diferencial(supabase, fechas, titulo));
       return new Response("ok");
     }
 
@@ -567,13 +781,36 @@ export default async (req) => {
     }
 
     if (primera === "/impuesto") {
-      const { data } = await supabase.from("impuesto_apartado").select("ganancia_clp,impuesto_clp,monto_operado_clp");
+      const { data } = await supabase.from("impuesto_apartado").select("ganancia_clp,impuesto_clp,monto_operado_clp,created_at");
       const lista = data ?? [];
-      if (!lista.length) { await reply("Aún no has registrado operaciones con ganancia."); return new Response("ok"); }
-      const totalOp = lista.reduce((s, r) => s + Number(r.monto_operado_clp), 0);
-      const totalGan = lista.reduce((s, r) => s + Number(r.ganancia_clp), 0);
-      const totalImp = Math.max(0, lista.reduce((s, r) => s + Number(r.impuesto_clp), 0));
-      await reply(`🧾 <b>Impuesto apartado</b>\n\nOperaciones: ${lista.length}\nVolumen operado: ${clp(totalOp)}\nGanancia total: ${clp(totalGan)}\n\n<b>💰 Apartado para SII (20%): ${clp(totalImp)}</b>\n<i>No tocar este dinero.</i>`);
+      if (!lista.length) { await reply("Aún no has registrado ventas con ganancia."); return new Response("ok"); }
+
+      const hoy = hoyChile();
+      const semana = diasAtras(7);
+      const mes = hoy.slice(0, 7);
+      const bloque = (filtro) => {
+        const f = lista.filter((r) => filtro(fechaChile(r.created_at)));
+        const gan = f.reduce((s, r) => s + Number(r.ganancia_clp), 0);
+        const imp = f.reduce((s, r) => s + Number(r.impuesto_clp), 0);
+        return { n: f.length, gan, apartar: Math.max(0, imp) };
+      };
+      const linea = (titulo, b) =>
+        `<b>${titulo}</b> (${b.n} ventas)\n  Ganancia: ${clp(b.gan)}\n  Apartar: <b>${clp(b.apartar)}</b>`;
+
+      const H = bloque((d) => d === hoy);
+      const S = bloque((d) => semana.includes(d));
+      const M = bloque((d) => d.startsWith(mes));
+      const T = bloque(() => true);
+
+      await reply(
+        `🧾 <b>Impuesto a apartar (${Math.round(IMPUESTO_P2P * 100)}% de la ganancia)</b>\n\n` +
+        `${linea("Hoy", H)}\n\n` +
+        `${linea("Últimos 7 días", S)}\n\n` +
+        `${linea("Este mes", M)}\n\n` +
+        `━━━━━━━━\n${linea("Total histórico", T)}\n\n` +
+        `<i>Las pérdidas descuentan. Si el periodo da negativo, se aparta $0.\n` +
+        `Ganancia medida contra tu costo promedio. Confirma la tasa real con tu contador.</i>`
+      );
       return new Response("ok");
     }
 
