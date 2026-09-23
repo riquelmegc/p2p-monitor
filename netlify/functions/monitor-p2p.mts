@@ -26,7 +26,7 @@ const TELEGRAM_ALERT_CHAT_ID = process.env.TELEGRAM_ALERT_CHAT_ID ?? process.env
 
 // --- Maker: comision por lado y margen neto minimo para avisar ---
 const MAKER_FEE_PCT = parseFloat(process.env.MAKER_FEE_PCT ?? "0.2"); // 0,2% por lado (anuncio)
-const MAKER_NET_MIN_PCT = parseFloat(process.env.MAKER_NET_MIN_PCT ?? "0.35"); // neto minimo por ciclo
+const MAKER_NET_MIN_PCT = parseFloat(process.env.MAKER_NET_MIN_PCT ?? "0.30"); // neto minimo por ciclo
 
 const ARB_ALERT_PCT = parseFloat(process.env.ARB_ALERT_PCT ?? "1.5");
 const ARB_CRYPTO_ALERT_PCT = parseFloat(process.env.ARB_CRYPTO_ALERT_PCT ?? "1.5");
@@ -38,14 +38,10 @@ const MONTO_GRANDE = parseFloat(process.env.MONTO_GRANDE ?? "500000");
 const MONTO_CHICO = parseFloat(process.env.MONTO_CHICO ?? "100000");
 const TOP_N = parseInt(process.env.TOP_N ?? "5", 10);
 
-// Alerta de expansion (bruta, sin comision): apagada por defecto porque avisaba margenes que no rinden
-const EXPANSION_ACTIVA = (process.env.EXPANSION_ACTIVA ?? "false") === "true";
-const EXPANSION_FACTOR = parseFloat(process.env.EXPANSION_FACTOR ?? "1.25");
-const EXPANSION_MIN_PCT = parseFloat(process.env.EXPANSION_MIN_PCT ?? "0.3");
-const EXPANSION_MIN_MUESTRAS = 6;
-
-// Recordatorio de ventana: cada N ciclos (12 x 10min = 2h)
-const RECORDATORIO_CADA = parseInt(process.env.RECORDATORIO_CADA ?? "12", 10);
+// Cada cuántos ciclos recordar que la ventana sigue abierta (60 x 2min = 2h)
+const RECORDATORIO_CADA = parseInt(process.env.RECORDATORIO_CADA ?? "60", 10);
+// Cada cuántos minutos se guarda una foto del mercado en la base (el chequeo corre cada 2 min)
+const SNAPSHOT_CADA_MIN = parseInt(process.env.SNAPSHOT_CADA_MIN ?? "10", 10);
 
 // Tiempo maximo por consulta externa (evita que una API lenta bloquee todo)
 const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS ?? "8000", 10);
@@ -179,26 +175,18 @@ async function binanceP2P(tradeType: "BUY" | "SELL", transAmount: number) {
 function evaluarSegmento(
   etiqueta: string,
   spreadPct: number,
-  serie: (number | null)[],
+  previaAbierta: boolean,
+  ciclosPrevios: number,
   topB: any[],
   topS: any[],
   medB: number,
   medS: number
-): { msgs: string[]; cerro: boolean } {
+): { msgs: string[]; cerro: boolean; abierta: boolean; ciclos: number } {
   const out: string[] = [];
   let cerro = false;
   const neto = netoMaker(spreadPct);
   const abierta = neto >= MAKER_NET_MIN_PCT;
-
-  const previo = serie.length && serie[0] !== null ? netoMaker(serie[0] as number) : null;
-  const previaAbierta = previo !== null && previo >= MAKER_NET_MIN_PCT;
-
-  let racha = 0;
-  for (const v of serie) {
-    if (v !== null && netoMaker(v) >= MAKER_NET_MIN_PCT) racha++;
-    else break;
-  }
-  const rachaActual = abierta ? racha + 1 : 0;
+  const rachaActual = abierta ? ciclosPrevios + 1 : 0;
 
   // Precios sugeridos para tus anuncios
   const ventaComp = r2(topB[0].precio - 0.01);
@@ -241,7 +229,7 @@ function evaluarSegmento(
     );
   }
 
-  return { msgs: out, cerro };
+  return { msgs: out, cerro, abierta, ciclos: rachaActual };
 }
 
 // ============================================================
@@ -253,7 +241,14 @@ function evaluarSegmento(
 async function vigilarMisPrecios(supabase: any, topB: any[], topS: any[]): Promise<string[]> {
   const { data: cfg } = await supabase.from("config_p2p").select("clave,valor");
   const val = (k: string) => Number(cfg?.find((c: any) => c.clave === k)?.valor ?? 0);
+  // Avisos por lado: si la clave no existe, el lado queda activo
+  const ladoActivo = (k: string) => {
+    const f = cfg?.find((c: any) => c.clave === k);
+    return f ? Number(f.valor) === 1 : true;
+  };
   if (val("mis_precios_activo") !== 1) return [];
+  const vigilarVenta = ladoActivo("mis_avisos_venta");
+  const vigilarCompra = ladoActivo("mis_avisos_compra");
 
   const miVenta = val("mi_precio_venta");
   const miCompra = val("mi_precio_compra");
@@ -271,7 +266,7 @@ async function vigilarMisPrecios(supabase: any, topB: any[], topS: any[]): Promi
 
   // --- Tu VENTA ---
   const rivalV = topB[0];
-  if (miVenta > 0 && rivalV && rivalV.precio < miVenta - 0.001) {
+  if (vigilarVenta && miVenta > 0 && rivalV && rivalV.precio < miVenta - 0.001) {
     if (Math.abs(rivalV.precio - refVenta) > 0.001) {
       const nuevo = r2(rivalV.precio - 0.01);
       const dif = nuevo - miCompra;
@@ -291,7 +286,7 @@ async function vigilarMisPrecios(supabase: any, topB: any[], topS: any[]): Promi
 
   // --- Tu COMPRA ---
   const rivalC = topS[0];
-  if (miCompra > 0 && rivalC && rivalC.precio > miCompra + 0.001) {
+  if (vigilarCompra && miCompra > 0 && rivalC && rivalC.precio > miCompra + 0.001) {
     if (Math.abs(rivalC.precio - refCompra) > 0.001) {
       const nuevo = r2(rivalC.precio + 0.01);
       const dif = miVenta - nuevo;
@@ -420,23 +415,14 @@ export default async () => {
         if (medBuy > 0 && medSell > 0) {
           const makerPct = ((medBuy - medSell) / medSell) * 100;
 
-          const desde = new Date(Date.now() - 8 * 3600 * 1000).toISOString();
-          const { data: hist } = await supabase
-            .from("p2p_snapshots")
-            .select("spread_pct,spread_pct_chico")
-            .eq("fuente", "binance_depth")
-            .gte("created_at", desde)
-            .order("created_at", { ascending: false })
-            .limit(60);
+          // Estado de las ventanas (guardado, no deducido del historial)
+          const { data: estCfg } = await supabase.from("config_p2p").select("clave,valor");
+          const est = (k: string) => Number(estCfg?.find((c: any) => c.clave === k)?.valor ?? 0);
 
-          const aNum = (v: any): number | null => {
-            const n = v === null || v === undefined ? NaN : Number(v);
-            return isNaN(n) ? null : n;
-          };
-          const serieGrande = (hist ?? []).map((h: any) => aNum(h.spread_pct));
-          const serieChico = (hist ?? []).map((h: any) => aNum(h.spread_pct_chico));
+          // La foto del mercado se guarda cada SNAPSHOT_CADA_MIN minutos
+          const guardarFoto = new Date().getUTCMinutes() % SNAPSHOT_CADA_MIN < 2;
 
-          const { error: eSnap } = await supabase.from("p2p_snapshots").insert({
+          const { error: eSnap } = guardarFoto ? await supabase.from("p2p_snapshots").insert({
             best_buy_clp: topBuy[0]?.precio ?? b?.ask ?? null,
             best_sell_clp: topSell[0]?.precio ?? b?.bid ?? null,
             avg_buy_clp: b?.totalAsk ?? null,
@@ -452,7 +438,7 @@ export default async () => {
             sell_top_chico: topSellChico.length ? topSellChico : null,
             fuente,
             spread_pct: Number(makerPct.toFixed(3)),
-          });
+          }) : { error: null };
           if (eSnap) console.error("p2p_snapshots insert:", eSnap.message);
 
           resumen.push({
@@ -465,20 +451,31 @@ export default async () => {
           });
 
           // --- ALERTAS MAKER por segmento (solo con datos directos de Binance) ---
+          const estados: { clave: string; valor: number }[] = [];
+
           if (fuente === "binance_depth" && topBuy.length && topSell.length) {
-            alerts.push(
-              ...evaluarSegmento(
-                `montos grandes ($${fmt(MONTO_GRANDE)})`,
-                makerPct, serieGrande, topBuy, topSell, medBuy, medSell
-              ).msgs
+            const gr = evaluarSegmento(
+              `montos grandes ($${fmt(MONTO_GRANDE)})`,
+              makerPct, est("ventana_grande") === 1, est("ciclos_grande"),
+              topBuy, topSell, medBuy, medSell
+            );
+            alerts.push(...gr.msgs);
+            estados.push(
+              { clave: "ventana_grande", valor: gr.abierta ? 1 : 0 },
+              { clave: "ciclos_grande", valor: gr.ciclos }
             );
           }
           if (makerPctCh !== null && topBuyChico.length && topSellChico.length) {
             const ch = evaluarSegmento(
               `montos chicos ($${fmt(MONTO_CHICO)})`,
-              makerPctCh, serieChico, topBuyChico, topSellChico, medBuyCh, medSellCh
+              makerPctCh, est("ventana_chico") === 1, est("ciclos_chico"),
+              topBuyChico, topSellChico, medBuyCh, medSellCh
             );
             alerts.push(...ch.msgs);
+            estados.push(
+              { clave: "ventana_chico", valor: ch.abierta ? 1 : 0 },
+              { clave: "ciclos_chico", valor: ch.ciclos }
+            );
 
             if (ch.cerro) {
               // Ventana chica cerrada: se apaga la vigilancia de tus precios
@@ -494,26 +491,9 @@ export default async () => {
             }
           }
 
-          // --- Expansion bruta (opcional, apagada por defecto) ---
-          const serie6h = serieGrande.slice(0, 36).filter((n): n is number => n !== null);
-          const promedio6h = serie6h.length ? serie6h.reduce((s, n) => s + n, 0) / serie6h.length : null;
-          const previo = serieGrande[0] ?? null;
-          if (
-            EXPANSION_ACTIVA &&
-            promedio6h !== null &&
-            serie6h.length >= EXPANSION_MIN_MUESTRAS &&
-            makerPct >= EXPANSION_MIN_PCT
-          ) {
-            const gatillo = promedio6h * EXPANSION_FACTOR;
-            const expandio = makerPct >= gatillo;
-            const previoExpandio = previo !== null && previo >= gatillo;
-            if (expandio && !previoExpandio) {
-              alerts.push(
-                `📈 <b>Expansión del spread (bruto)</b>\n` +
-                  `Ahora: <b>${makerPct.toFixed(2)}%</b> · neto ${netoMaker(makerPct).toFixed(2)}%\n` +
-                  `Promedio 6h: ${promedio6h.toFixed(2)}% (${serie6h.length} muestras)`
-              );
-            }
+          if (estados.length) {
+            const ahora = new Date().toISOString();
+            await supabase.from("config_p2p").upsert(estados.map((e) => ({ ...e, updated_at: ahora })));
           }
 
           if (BUY_OPPORTUNITY_CLP > 0 && medBuy <= BUY_OPPORTUNITY_CLP) {
@@ -595,7 +575,7 @@ export default async () => {
   }
 };
 
-// Cron: cada 10 minutos
+// Cron: cada 2 minutos (la foto del mercado se guarda cada 10)
 export const config: Config = {
-  schedule: "*/10 * * * *",
+  schedule: "*/2 * * * *",
 };
